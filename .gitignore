@@ -20,10 +20,6 @@ make_factory.ps1
 *.log
 *.tmp
 
-# Claude / AI assistant
-.claude/
-CLAUDE.md
-
 # OS files
 .DS_Store
 Thumbs.db
