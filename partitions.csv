@@ -1,0 +1,8 @@
+# Name,    Type, SubType, Offset,   Size,    Flags
+# App at 0x60000 to match the stock M1 ESP-AT layout (ota_0 @ 0x60000) so the
+# existing flashing tools and the on-device flasher land app-only updates at the
+# conventional address. Changing this offset requires a one-time full-factory
+# flash (bootloader + partition table + app) to take effect.
+nvs,       data, nvs,     0x9000,   0x6000,
+phy_init,  data, phy,     0xf000,   0x1000,
+factory,   app,  factory, 0x60000,  0x3A0000,

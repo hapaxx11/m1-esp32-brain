@@ -1,0 +1,40 @@
+menu "M1 SPI Link"
+
+    config M1_SPI_PIN_SCLK
+        int "SPI SCLK GPIO (ESP32-C6)"
+        default 7
+        help
+            Default 7 = M1 PCB wiring. Bench (XIAO) overlay sets 17.
+
+    config M1_SPI_PIN_MOSI
+        int "SPI MOSI GPIO (ESP32-C6)"
+        default 12
+        help
+            Default 12 = M1 PCB. Bench (XIAO) = 2.
+
+    config M1_SPI_PIN_MISO
+        int "SPI MISO GPIO (ESP32-C6)"
+        default 13
+        help
+            Default 13 = M1 PCB. Bench (XIAO) = 21.
+
+    config M1_SPI_PIN_CS
+        int "SPI CS GPIO (ESP32-C6)"
+        default 15
+        help
+            Default 15 = M1 PCB. Bench (XIAO) = 22.
+
+    config M1_SPI_PIN_HS
+        int "SPI handshake (DATA_READY) GPIO (ESP32-C6)"
+        default 14
+        help
+            ESP32 output -> M1 input. Default 14 = M1 PCB. Bench (XIAO) = 23.
+
+    config M1_SPI_MODE
+        int "SPI mode (0..3)"
+        default 1
+        help
+            SPI mode 1 (CPOL=0, CPHA=1) matches the M1 SPI master and the
+            ESP-AT SPI-HD slave. Do not change without matching the master.
+
+endmenu

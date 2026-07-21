@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+build-bench/
+build-*/
+
+# Managed components are fetched by the IDF component manager
+managed_components/
+dependencies.lock
+
+# Generated sdkconfig (regenerated from sdkconfig.defaults)
+sdkconfig
+sdkconfig.old
+
+# Build helper scripts (contain machine-specific paths)
+build_now.ps1
+make_factory.ps1
+*.bat
+
+# Logs / temporary
+*.log
+*.tmp
+
+# Claude / AI assistant
+.claude/
+CLAUDE.md
+
+# OS files
+.DS_Store
+Thumbs.db

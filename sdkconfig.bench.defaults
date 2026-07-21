@@ -1,0 +1,20 @@
+# Bench overlay — XIAO ESP32-C6 + Pico master (pico-at-bridge wiring).
+# Apply ON TOP of sdkconfig.defaults; leaves M1-target defaults untouched:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bench.defaults" build
+#
+# XIAO D-pin -> GPIO wiring (per pico-at-bridge/SETUP.md):
+#   SCLK D7=GPIO17  MOSI D2=GPIO2  MISO D3=GPIO21  CS D4=GPIO22  HS D5=GPIO23
+CONFIG_M1_SPI_PIN_SCLK=17
+CONFIG_M1_SPI_PIN_MOSI=2
+CONFIG_M1_SPI_PIN_MISO=21
+CONFIG_M1_SPI_PIN_CS=22
+CONFIG_M1_SPI_PIN_HS=23
+CONFIG_M1_SPI_MODE=1
+
+# GPIO17 is SPI SCLK on the bench, but ESP32-C6 UART0 console defaults to
+# GPIO16/17. Keep the log console on USB-Serial-JTAG (native USB, COM6) and
+# move the custom UART off 16/17 so SCLK is free. Mirrors the ESP-AT bench.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=14
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=15
