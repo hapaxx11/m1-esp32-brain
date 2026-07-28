@@ -25,6 +25,7 @@
 #include "ble_hid.h"
 #include "ble_scan.h"
 #include "ble_conn.h"
+#include "ble_spam.h"
 #include "ieee802154_sniff.h"
 #include "esp_now_link.h"
 #include "m1_rpc.h"
@@ -41,9 +42,17 @@
 
 static const char *TAG = "main";
 
-/* This firmware's identity + honest capability set (only features actually wired). */
+/* This firmware's identity + honest capability set (only features actually wired).
+ * Every bit below has a working handler in dispatch_request(); do not advertise a
+ * capability whose handler still returns NAK (PMKID/OTA/SET_MAC/SET_CHAN/NETSCAN
+ * /BLE_GATT are intentionally omitted until implemented). */
 #define M1_FW_NAME  "m1-native"
-#define M1_FW_CAPS  (M1_CAP_WIFI_SCAN | M1_CAP_WIFI_JOIN | M1_CAP_DEAUTH | M1_CAP_PKTMON)
+#define M1_FW_CAPS  (M1_CAP_WIFI_SCAN | M1_CAP_WIFI_JOIN | M1_CAP_DEAUTH   | \
+                     M1_CAP_PKTMON    | M1_CAP_STA_SCAN  | M1_CAP_BEACON   | \
+                     M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
+                     M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
+                     M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
+                     M1_CAP_KARMA)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
@@ -57,6 +66,10 @@ static void handle_zb_sniff_start(const m1_rpc_header_t *hdr,
                                   const uint8_t *payload, uint16_t len);
 static void handle_zb_sniff_stop(const m1_rpc_header_t *hdr);
 static void handle_zb_sniff_get(const m1_rpc_header_t *hdr);
+static void handle_zb_flood_start(const m1_rpc_header_t *hdr,
+                                  const uint8_t *payload, uint16_t len);
+static void handle_zb_inject(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len);
 
 /* ESP-NOW peer-link handlers (defined below dispatch_request) */
 static void handle_now_start(const m1_rpc_header_t *hdr,
@@ -135,7 +148,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 0; v.patch = 0;
+    v.major = 1; v.minor = 0; v.patch = 3;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -203,7 +216,10 @@ static void handle_wifi_scan(const m1_rpc_header_t *hdr)
     if (count > 0) {
         records = malloc(count * sizeof(wifi_ap_record_t));
         if (records) esp_wifi_scan_get_ap_records(&count, records);
-        else count = 0;
+        /* On malloc failure the driver's internal AP list is still held; free it
+         * explicitly (esp_wifi_scan_get_ap_records would have) so it doesn't leak
+         * every scan under memory pressure. */
+        else { esp_wifi_clear_ap_list(); count = 0; }
     }
 
     /* Payload: [count:2 LE] then per AP: m1_rpc_scan_entry_t + ssid bytes */
@@ -363,6 +379,51 @@ static void handle_beacon_start(const m1_rpc_header_t *hdr,
     cfg.interval_ms = 0;
     if (j == 0) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
     esp_err_t err = wifi_attack_beacon_start(&cfg);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* Probe-request flood. Payload: [channel:1][count:1] then [len:1][ssid] x count
+ * (count 0 = wildcard broadcast probes). */
+static void handle_probe_start(const m1_rpc_header_t *hdr,
+                               const uint8_t *payload, uint16_t len)
+{
+    uint8_t channel = (len >= 1) ? payload[0] : 1;
+    uint8_t count   = (len >= 2) ? payload[1] : 0;
+    static char ssids[16][33];
+    uint16_t off = 2;
+    int j = 0;
+    for (int i = 0; i < count && j < 16; i++) {
+        if (off >= len) break;
+        uint8_t l = payload[off++];
+        if ((uint16_t)(off + l) > len) break;
+        uint8_t cl = l < 32 ? l : 32;
+        memcpy(ssids[j], &payload[off], cl);
+        ssids[j][cl] = 0;
+        off += l;
+        j++;
+    }
+    esp_err_t err = wifi_attack_probe_start((const char (*)[33])ssids, (uint8_t)j, channel);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* Karma auto-responder. Payload: [channel:1]. */
+static void handle_karma_start(const m1_rpc_header_t *hdr,
+                               const uint8_t *payload, uint16_t len)
+{
+    uint8_t channel = (len >= 1) ? payload[0] : 1;
+    esp_err_t err = wifi_attack_karma_start(channel);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* Raw 802.11 injection. Payload: [channel:1][raw 802.11 frame...]. */
+static void handle_raw_tx(const m1_rpc_header_t *hdr,
+                          const uint8_t *payload, uint16_t len)
+{
+    if (len < 11) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    esp_err_t err = wifi_attack_raw_tx(payload[0], &payload[1], (size_t)(len - 1));
     if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
@@ -612,7 +673,11 @@ static void handle_ble_scan_results(const m1_rpc_header_t *hdr)
 
     /* Payload: [count:2 LE] then per dev: addr[6], addr_type, rssi(i8),
      * name_len, name[name_len]. Cap to one m1_link frame (no frag yet). */
-    uint8_t *resp = malloc(M1L_PAYLOAD_MAX);
+    /* Allocate the full RPC payload (fragmented across frames by m1_link), matching
+     * the M1_SCAN_RESP_MAX cap used below. The previous M1L_PAYLOAD_MAX (502) alloc
+     * was smaller than the 1800-byte cap, so many/long-named BLE advertisers (names
+     * are attacker-controlled) overflowed the heap. Mirrors handle_wifi_scan. */
+    uint8_t *resp = malloc(M1_RPC_MAX_PAYLOAD);
     if (!resp) { send_nak(hdr->msg_id, M1_RPC_ERR_NO_MEM); return; }
     uint16_t off = 2, filled = 0;
     for (int i = 0; i < cnt; i++) {
@@ -653,6 +718,17 @@ static void handle_ble_advertise(const m1_rpc_header_t *hdr,
         name[n] = 0;
     }
     esp_err_t err = ble_adv_start(name);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* ---------- BLE spam (proximity-pair popup flooder) ---------- */
+
+static void handle_ble_spam_start(const m1_rpc_header_t *hdr,
+                                  const uint8_t *payload, uint16_t len)
+{
+    uint8_t mode = (len >= 1) ? payload[0] : BLE_SPAM_MODE_ALL;
+    esp_err_t err = ble_spam_start(mode);
     if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
@@ -756,6 +832,23 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         wifi_attack_beacon_stop();
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
+    case M1_RPC_OFF_PROBE_START:
+        handle_probe_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_OFF_PROBE_STOP:
+        wifi_attack_probe_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_OFF_KARMA_START:
+        handle_karma_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_OFF_KARMA_STOP:
+        wifi_attack_karma_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_OFF_RAW_TX:
+        handle_raw_tx(hdr, payload, payload_len);
+        break;
     case M1_RPC_OFF_MONITOR_START:
         handle_monitor_start(hdr, payload, payload_len);
         break;
@@ -817,6 +910,13 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         ble_adv_stop();
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
+    case M1_RPC_BLE_SPAM_START:
+        handle_ble_spam_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_SPAM_STOP:
+        ble_spam_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
 
     /* 802.15.4 (Zigbee/Thread) device discovery */
     case M1_RPC_ZB_SNIFF_START:
@@ -827,6 +927,16 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_ZB_SNIFF_GET:
         handle_zb_sniff_get(hdr);
+        break;
+    case M1_RPC_ZB_FLOOD_START:
+        handle_zb_flood_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_ZB_FLOOD_STOP:
+        ieee802154_flood_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_ZB_INJECT:
+        handle_zb_inject(hdr, payload, payload_len);
         break;
 
     /* ESP-NOW peer-to-peer M1<->M1 link */
@@ -897,6 +1007,24 @@ static void handle_zb_sniff_get(const m1_rpc_header_t *hdr)
     static uint8_t buf[1 + 64 * sizeof(m1_rpc_zb_device_t)];   /* [count][devices] */
     int n = ieee802154_sniff_get(buf, sizeof(buf));
     send_resp(hdr->msg_id, buf, (uint16_t)n);
+}
+
+static void handle_zb_flood_start(const m1_rpc_header_t *hdr,
+                                  const uint8_t *payload, uint16_t len)
+{
+    uint8_t channel = (len >= 1) ? payload[0] : 0;   /* 0 = sweep 11-26 */
+    esp_err_t err = ieee802154_flood_start(channel);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_zb_inject(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (len < 1 || len > 125) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    esp_err_t err = ieee802154_inject(payload, (uint8_t)len);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
 
 /* ---------- ESP-NOW peer-to-peer M1<->M1 link ---------- */

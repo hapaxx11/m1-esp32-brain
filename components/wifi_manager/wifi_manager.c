@@ -219,7 +219,12 @@ esp_err_t wifi_mgr_scan(wifi_mgr_scan_cb_t callback)
     }
 
     wifi_ap_record_t *records = malloc(count * sizeof(wifi_ap_record_t));
-    if (!records) return ESP_ERR_NO_MEM;
+    if (!records) {
+        /* Free the driver's internal AP list even when we can't allocate for it,
+         * otherwise it leaks every scan under memory pressure. */
+        esp_wifi_clear_ap_list();
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_wifi_scan_get_ap_records(&count, records);
     if (callback) callback(records, count);

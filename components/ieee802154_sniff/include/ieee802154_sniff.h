@@ -23,3 +23,15 @@ esp_err_t ieee802154_sniff_stop(void);
  *   [u8 count][m1_rpc_zb_device_t x count]   (capped to what fits in `cap`).
  * Returns the number of bytes written. Safe to call while running (live view). */
 int ieee802154_sniff_get(uint8_t *buf, int cap);
+
+/* ---- Offensive TX (shares the single radio; mutually exclusive with sniff) ----
+ * Beacon-request flood: hammer broadcast MAC Beacon-Request commands, which every
+ * Zigbee coordinator/router is obliged to answer — floods the channel and the
+ * devices' request handlers. channel 0 = sweep 11-26, else dwell that channel. */
+esp_err_t ieee802154_flood_start(uint8_t channel);
+esp_err_t ieee802154_flood_stop(void);
+
+/* One-shot raw injection: transmit an arbitrary 802.15.4 MAC frame (the caller
+ * supplies the MPDU WITHOUT the 2-byte FCS; hardware appends it). Uses the
+ * current radio channel. len 1..125. Returns ESP_OK if the frame was queued. */
+esp_err_t ieee802154_inject(const uint8_t *mpdu, uint8_t len);

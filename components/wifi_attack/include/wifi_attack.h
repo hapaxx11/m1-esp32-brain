@@ -96,6 +96,18 @@ uint16_t wifi_attack_monitor_read(uint8_t *out, uint16_t out_cap,
  * buffer, buffered = frames currently waiting to be read. */
 void wifi_attack_monitor_stats(uint32_t *total, uint32_t *dropped, uint8_t *buffered);
 
+/* ---------- Probe-request flood ---------- */
+/* Broadcast probe requests with a random source MAC. count==0 -> wildcard. */
+esp_err_t wifi_attack_probe_start(const char ssids[][33], uint8_t count, uint8_t channel);
+esp_err_t wifi_attack_probe_stop(void);
+
+/* ---------- Karma (probe-response auto-responder) ---------- */
+esp_err_t wifi_attack_karma_start(uint8_t channel);
+esp_err_t wifi_attack_karma_stop(void);
+
+/* ---------- Raw 802.11 injection (one-shot) ---------- */
+esp_err_t wifi_attack_raw_tx(uint8_t channel, const uint8_t *frame, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
