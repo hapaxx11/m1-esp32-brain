@@ -28,6 +28,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 
 #include "ble_hid.h"
+#include "ble_nus.h"
 
 #define TAG "BLE_HID"
 
@@ -514,6 +515,9 @@ ble_host_on_sync(void)
 
     /* Let a scan that was requested before sync begin now. */
     ble_scan_on_host_sync();
+
+    /* Apply a Bluetooth-Direct (NUS) advertise-start requested before sync. */
+    ble_nus_on_host_synced();
 }
 
 static void
@@ -608,6 +612,13 @@ ble_host_ensure_started(void)
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
     err = ble_hid_gatt_register();
+    if (err != ESP_OK)
+        return err;
+
+    /* Register the NUS ("Bluetooth Direct") service into the same GATT table.
+     * Inert until ble_nus_adv_start() is called via the M1 toggle. Must happen
+     * here, before the host task starts (dynamic service registration is off). */
+    err = ble_nus_gatt_register();
     if (err != ESP_OK)
         return err;
 

@@ -183,6 +183,7 @@ typedef enum {
     M1_RPC_BLE_HID_STATUS      = 0x040C, /* REQ -> RESP u8 connected */
     M1_RPC_BLE_SPAM_START      = 0x040D, /* REQ u8 mode -> RESP u8 status (adv-spam popups) */
     M1_RPC_BLE_SPAM_STOP       = 0x040E, /* REQ (none) -> RESP u8 status */
+    M1_RPC_BLE_RPC_ADV         = 0x040F, /* REQ u8 enable -> RESP u8 status — Bluetooth-Direct (NUS) advertising */
 
     /* ---- Zigbee / 802.15.4 0x0500-0x05FF ---- */
     M1_RPC_ZB_INIT             = 0x0500,
@@ -285,6 +286,7 @@ typedef enum {
 #define M1_CAP_OTA           (UINT64_C(1) << 20)
 #define M1_CAP_BLE_SPAM      (UINT64_C(1) << 21)
 #define M1_CAP_802154_TX     (UINT64_C(1) << 22)
+#define M1_CAP_SOFTAP        (UINT64_C(1) << 23)
 
 #define M1_RPC_FW_NAME_LEN   32
 

@@ -50,3 +50,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # Captive portal: browsers send >512B of request headers; raise the limit
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
+
+# Internet passthrough for the WiFi Hotspot (NAT)
+CONFIG_LWIP_IP_FORWARD=y
+CONFIG_LWIP_IPV4_NAPT=y

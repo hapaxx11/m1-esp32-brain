@@ -68,6 +68,20 @@ esp_err_t rpc_server_send_raw(const uint8_t *frame, uint16_t len);
  * (the ESP couldn't answer it locally). For the M1's QMON_POLL. 0 if none. */
 int rpc_server_relay_dequeue(uint8_t *buf, int max);
 
+/* --- BLE (Bluetooth Direct) transport bridge ---
+ * BLE and TCP are mutually exclusive as the active RPC client. ble_nus registers
+ * a TX callback and feeds RX bytes here; both reuse the same parser + relay. */
+typedef bool (*rpc_ble_tx_fn)(const uint8_t *data, uint16_t len);
+
+/* Register the callback that sends M1->host bytes over the BLE NUS link. */
+void rpc_server_set_ble_tx(rpc_ble_tx_fn fn);
+
+/* Mark BLE as the active client (true on BLE connect, false on disconnect). */
+void rpc_server_ble_set_active(bool active);
+
+/* Feed bytes received on the BLE RX characteristic into the RPC parser/relay. */
+void rpc_server_feed_ble(const uint8_t *data, uint16_t len);
+
 #ifdef __cplusplus
 }
 #endif

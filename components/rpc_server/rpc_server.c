@@ -69,6 +69,20 @@ static uint32_t         s_screen_epoch;    /* bumped on every SCREEN_START */
 static int              s_udp_fd = -1;
 static QueueHandle_t    s_screen_mbox;     /* length 1, item = SCREEN_FB_SIZE (overwrite) */
 
+/* --- BLE "Bluetooth Direct" transport: one client at a time with TCP ---
+ * The BLE side (ble_nus) feeds RX bytes here and registers a tx callback; the
+ * active client determines where responses + screen frames are routed. */
+typedef enum { CLIENT_NONE, CLIENT_TCP, CLIENT_BLE } client_kind_t;
+static volatile client_kind_t s_active = CLIENT_NONE;
+static volatile bool          s_ble_connected = false;  /* a BLE phone is linked */
+static rpc_ble_tx_fn          s_ble_tx = NULL;
+static volatile bool          s_screen_ble = false;   /* screen mirroring over BLE (marker) */
+#define SCREEN_FRAME_CMD   0x12   /* RPC_CMD_SCREEN_FRAME on the M1/host side */
+
+/* Defined below; forward-declared because screen_tx_task (BLE path) uses it. */
+static uint16_t build_frame(uint8_t *frame, uint8_t cmd, uint8_t seq,
+                            const uint8_t *payload, uint16_t payload_len);
+
 /* --- Screen cache path: M1 SCREEN_PUSH -> depth-1 overwrite mailbox (newest
  * wins). Called from the command-dispatch task. --- */
 void rpc_server_update_screen(const uint8_t *fb, uint16_t len)
@@ -104,11 +118,29 @@ static void udp_target_clear(void)
 static void screen_tx_task(void *arg)
 {
     static uint8_t dg[SCREEN_DGRAM_SIZE];
+    static uint8_t bf[5 + SCREEN_FB_SIZE + 2];   /* framed SCREEN_FRAME for BLE */
     uint8_t fb[SCREEN_FB_SIZE];
     uint16_t frame_seq = 0;
+    TickType_t last_ble_tick = 0;
 
     for (;;) {
         if (xQueueReceive(s_screen_mbox, fb, portMAX_DELAY) != pdTRUE) continue;
+
+        /* BLE (Bluetooth Direct) screen path: no UDP channel — send the frame
+         * inline as a SCREEN_FRAME control frame over the NUS TX characteristic
+         * (ble_nus_send chunks it to the MTU). Throttle to ~5fps: BLE is low
+         * bandwidth and this competes with WiFi/BLE coex airtime. */
+        if (s_screen_ble && s_ble_tx) {
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_ble_tick) < pdMS_TO_TICKS(200))
+                continue;                 /* drop this frame — 5fps cap */
+            last_ble_tick = now;
+            uint16_t n = build_frame(bf, SCREEN_FRAME_CMD, (uint8_t)frame_seq,
+                                     fb, SCREEN_FB_SIZE);
+            s_ble_tx(bf, n);
+            frame_seq++;
+            continue;
+        }
 
         struct sockaddr_in dst;
         uint32_t epoch;
@@ -182,13 +214,30 @@ static bool client_send_all(const uint8_t *buf, int len)
     return true;
 }
 
+/* Send a complete framed buffer to whichever transport is the active client.
+ * BLE goes out the NUS notify path; TCP uses the socket (control task only). */
+static bool send_to_active(const uint8_t *frame, uint16_t len)
+{
+    if (s_active == CLIENT_BLE)
+        return s_ble_tx ? s_ble_tx(frame, len) : false;
+    return client_send_all(frame, (int)len);
+}
+
 /* --- Public send API: queue for the control task to write --- */
 
 esp_err_t rpc_server_send(uint8_t cmd, uint8_t seq,
                           const uint8_t *payload, uint16_t payload_len)
 {
-    if (s_client_fd < 0) return ESP_ERR_INVALID_STATE;
     if (payload_len > QMON_MAX_PAYLOAD) return ESP_ERR_INVALID_ARG;
+
+    /* BLE active client: frame it and notify directly (no TCP socket/queue). */
+    if (s_active == CLIENT_BLE) {
+        uint8_t bf[5 + QMON_MAX_PAYLOAD + 2];
+        uint16_t n = build_frame(bf, cmd, seq, payload, payload_len);
+        return (s_ble_tx && s_ble_tx(bf, n)) ? ESP_OK : ESP_FAIL;
+    }
+
+    if (s_client_fd < 0) return ESP_ERR_INVALID_STATE;
     if (!s_out_q) return ESP_ERR_INVALID_STATE;
 
     uint8_t *frame = malloc(5 + payload_len + 2);
@@ -201,6 +250,9 @@ esp_err_t rpc_server_send(uint8_t cmd, uint8_t seq,
 
 esp_err_t rpc_server_send_raw(const uint8_t *frame, uint16_t len)
 {
+    /* BLE active client: send directly over NUS notify (no TCP socket/queue). */
+    if (s_active == CLIENT_BLE)
+        return (s_ble_tx && s_ble_tx(frame, len)) ? ESP_OK : ESP_FAIL;
     if (s_client_fd < 0) return ESP_ERR_INVALID_STATE;
     if (!s_out_q) return ESP_ERR_INVALID_STATE;
     uint8_t *cp = malloc(len);
@@ -229,7 +281,9 @@ esp_err_t rpc_server_broadcast(uint8_t cmd,
 
 bool rpc_server_client_connected(void)
 {
-    return s_client_fd >= 0;
+    /* A BLE (Bluetooth Direct) client counts too, so the M1 relays to it even
+     * when WiFi is down. */
+    return s_client_fd >= 0 || s_ble_connected;
 }
 
 /* Queue a raw qMonstatek command frame for the M1 to pull via QMON_POLL. */
@@ -245,28 +299,39 @@ static void relay_to_m1(const uint8_t *frame, uint16_t frame_len)
 /* --- Control-frame dispatch (called from the control task) --- */
 
 static void dispatch_frame(const uint8_t *frame, uint8_t cmd, uint8_t seq,
-                           const uint8_t *payload, uint16_t len, uint16_t frame_len)
+                           const uint8_t *payload, uint16_t len, uint16_t frame_len,
+                           client_kind_t src)
 {
     switch (cmd) {
     case QMON_CMD_PING: {
         uint8_t pf[7];
         uint16_t n = build_frame(pf, QMON_CMD_PONG, seq, NULL, 0);
-        client_send_all(pf, n);
+        /* Answer on the transport the ping arrived on. */
+        if (src == CLIENT_BLE) { if (s_ble_tx) s_ble_tx(pf, n); }
+        else                   client_send_all(pf, n);
         break;
     }
     case QMON_CMD_SCREEN_START:
-        /* payload: [fps:u8][udp_port:u16 LE]. Old 1-byte form (fps only) has no
-         * UDP target -> treat as stop. Either way relay to the M1 so its screen
-         * stream state matches the desktop's request. */
-        if (len >= 3) {
+        /* Route the screen by the transport that DELIVERED this SCREEN_START, not
+         * by the global active client — that's what keeps a BLE screen on BLE even
+         * if a WiFi/TCP session also exists. Over BLE there's no UDP channel (the
+         * app sends udp_port==0); the frames go inline over the NUS TX char
+         * (screen_tx_task). Either way relay to the M1 to match its stream state. */
+        if (src == CLIENT_BLE) {
+            s_screen_ble = true;
+            udp_target_clear();
+        } else if (len >= 3) {
             uint16_t udp_port = (uint16_t)payload[1] | ((uint16_t)payload[2] << 8);
+            s_screen_ble = false;
             udp_target_set(udp_port);
         } else {
+            s_screen_ble = false;
             udp_target_clear();
         }
         relay_to_m1(frame, frame_len);
         break;
     case QMON_CMD_SCREEN_STOP:
+        s_screen_ble = false;
         udp_target_clear();
         relay_to_m1(frame, frame_len);
         break;
@@ -289,6 +354,7 @@ typedef struct {
     uint16_t got;
     uint8_t  cmd, seq;
     uint16_t len;
+    client_kind_t src;               /* transport this parser feeds (TCP or BLE) */
 } parser_t;
 
 static void parser_reset(parser_t *p) { p->st = PS_SYNC; p->got = 0; }
@@ -327,7 +393,7 @@ static void parser_feed(parser_t *p, uint8_t b)
             if (rxcrc == m1_rpc_crc16(&p->frame[1], 4 + p->len)) {
                 uint16_t frame_len = 7 + p->len;
                 dispatch_frame(p->frame, p->cmd, p->seq,
-                               &p->frame[5], p->len, frame_len);
+                               &p->frame[5], p->len, frame_len, p->src);
             } else {
                 ESP_LOGW(TAG, "bad CRC, dropping cmd=0x%02X", p->cmd);
             }
@@ -335,6 +401,38 @@ static void parser_feed(parser_t *p, uint8_t b)
         }
         break;
     }
+}
+
+/* --- BLE (Bluetooth Direct) bridge: a second parser instance feeds the SAME
+ * dispatch/relay path as TCP. dispatch_frame routes its local replies (PONG) and
+ * the relay routes commands to the M1 exactly as for WiFi. --- */
+static parser_t s_ble_parser;
+
+void rpc_server_set_ble_tx(rpc_ble_tx_fn fn)
+{
+    s_ble_tx = fn;
+}
+
+void rpc_server_ble_set_active(bool active)
+{
+    if (active) {
+        parser_reset(&s_ble_parser);
+        s_ble_parser.src = CLIENT_BLE;
+        s_ble_connected = true;
+        s_active = CLIENT_BLE;
+    } else {
+        s_ble_connected = false;
+        s_screen_ble = false;
+        /* Fall back to a TCP client if one happens to be connected, else idle. */
+        s_active = (s_client_fd >= 0) ? CLIENT_TCP : CLIENT_NONE;
+    }
+}
+
+void rpc_server_feed_ble(const uint8_t *data, uint16_t len)
+{
+    if (s_active != CLIENT_BLE) return;   /* ignore stray writes when not active */
+    for (uint16_t i = 0; i < len; i++)
+        parser_feed(&s_ble_parser, data[i]);
 }
 
 /* --- Session lifecycle --- */
@@ -347,6 +445,10 @@ static void close_client(void)
         s_client_fd = -1;
     }
     udp_target_clear();                 /* screen has no life beyond the session */
+    /* Revert the active client: back to BLE if a Bluetooth-Direct phone is still
+     * linked, otherwise idle. (Never strand a live BLE session at NONE.) */
+    if (s_active == CLIENT_TCP)
+        s_active = s_ble_connected ? CLIENT_BLE : CLIENT_NONE;
     wifi_mgr_set_ps_active(false);      /* back to battery power-save */
     ESP_LOGI(TAG, "Client disconnected (reason=%u)", s_last_exit_reason);
 }
@@ -386,6 +488,7 @@ static void accept_new(void)
     xSemaphoreGive(s_udp_mutex);
 
     s_client_fd = fd;
+    s_active = CLIENT_TCP;               /* TCP is now the active RPC client */
     wifi_mgr_set_ps_active(true);        /* low-latency while a client is connected */
     ESP_LOGI(TAG, "Client connected (fd=%d)", fd);
 }
@@ -434,6 +537,7 @@ static void rpc_control_task(void *arg)
 
     parser_t parser;
     parser_reset(&parser);
+    parser.src = CLIENT_TCP;   /* this parser feeds the WiFi/TCP transport */
 
     uint8_t rbuf[512];
 

@@ -58,6 +58,18 @@ void wifi_mgr_set_ps_active(bool active);
 /* Start AP mode */
 esp_err_t wifi_mgr_start_ap(void);
 
+/* SoftAP ("WiFi Hotspot"): bring up / tear down at runtime, and count clients. */
+esp_err_t wifi_mgr_softap_start(const char *ssid, const char *pass, uint8_t channel);
+esp_err_t wifi_mgr_softap_stop(void);
+uint8_t   wifi_mgr_softap_sta_count(void);
+
+/* True while hotspot clients are being NAT'd out to the internet (STA upstream). */
+bool wifi_mgr_softap_internet_shared(void);
+
+/* Re-evaluate + (re)enable NAT passthrough. Idempotent; safe to call on a poll.
+ * Enables NAT as soon as the AP is up AND the STA has an upstream IP. */
+bool wifi_mgr_napt_refresh(void);
+
 /* Scan for nearby APs */
 esp_err_t wifi_mgr_scan(wifi_mgr_scan_cb_t callback);
 

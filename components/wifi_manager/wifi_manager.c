@@ -25,6 +25,11 @@ static EventGroupHandle_t  s_wifi_events;
 static wifi_mgr_config_t   s_config;
 static esp_netif_t        *s_sta_netif;
 static esp_netif_t        *s_ap_netif;
+
+/* WiFi Hotspot internet passthrough (NAT). Enabled when the AP is up AND the STA
+ * has an upstream IP; refreshed on STA got-IP and hotspot start. */
+static bool s_napt_on = false;
+bool wifi_mgr_napt_refresh(void);
 static wifi_mgr_pkt_cb_t   s_pkt_cb;
 static bool                s_initialized;
 
@@ -81,6 +86,9 @@ static void event_handler(void *arg, esp_event_base_t base,
          * expects "_http"-style names; without it the advertised type is malformed
          * and the desktop's _m1rpc._tcp browse never matches (why discovery broke). */
         wifi_mgr_register_mdns("m1", "_m1rpc", 3333);
+        /* If the hotspot is up, we now have upstream internet — turn on NAT so
+         * hotspot clients can reach it. */
+        wifi_mgr_napt_refresh();
     }
 }
 
@@ -201,6 +209,119 @@ esp_err_t wifi_mgr_start_ap(void)
 {
     /* AP starts automatically in AP/APSTA mode */
     return ESP_OK;
+}
+
+/* Bring up a SoftAP ("WiFi Hotspot") at runtime. Uses APSTA when a station
+ * connection already exists so a joined network survives, else plain AP. WPA2 if
+ * the password is >= 8 chars, else open. The AP netif (created in wifi_mgr_init)
+ * runs a DHCP server so clients get an IP and reach the RPC server on :3333. */
+esp_err_t wifi_mgr_softap_start(const char *ssid, const char *pass, uint8_t channel)
+{
+    if (ssid == NULL || ssid[0] == '\0') return ESP_ERR_INVALID_ARG;
+
+    if (!s_initialized) {
+        wifi_mgr_config_t cfg = {0};
+        cfg.mode = WIFI_MGR_MODE_AP;
+        cfg.ap_channel = channel;
+        strncpy(cfg.ap_ssid, ssid, sizeof(cfg.ap_ssid) - 1);
+        if (pass) strncpy(cfg.ap_pass, pass, sizeof(cfg.ap_pass) - 1);
+        return wifi_mgr_init(&cfg);
+    }
+
+    wifi_mode_t cur = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&cur);
+    wifi_mode_t want = (cur == WIFI_MODE_STA || cur == WIFI_MODE_APSTA)
+                     ? WIFI_MODE_APSTA : WIFI_MODE_AP;
+    esp_err_t err = esp_wifi_set_mode(want);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .channel        = channel ? channel : 1,
+            .max_connection = 4,
+            .authmode       = (pass && strlen(pass) >= 8) ? WIFI_AUTH_WPA2_PSK
+                                                          : WIFI_AUTH_OPEN,
+        },
+    };
+    strncpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid));
+    ap_cfg.ap.ssid_len = strlen(ssid);
+    if (pass) strncpy((char *)ap_cfg.ap.password, pass, sizeof(ap_cfg.ap.password));
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err != ESP_OK) return err;
+
+    esp_wifi_start();   /* no-op if already started */
+    ESP_LOGI(TAG, "SoftAP up: \"%s\" ch=%u %s", ssid, channel,
+             (ap_cfg.ap.authmode == WIFI_AUTH_OPEN) ? "open" : "wpa2");
+
+    /* If an upstream STA link already has internet, share it to AP clients now.
+     * (Otherwise it turns on automatically when the STA gets an IP.) */
+    wifi_mgr_napt_refresh();
+    return ESP_OK;
+}
+
+/* Tear the SoftAP down, returning to STA-only. */
+esp_err_t wifi_mgr_softap_stop(void)
+{
+    if (!s_initialized) return ESP_OK;
+    s_napt_on = false;
+    return esp_wifi_set_mode(WIFI_MODE_STA);
+}
+
+/* Number of stations currently associated to the SoftAP. */
+uint8_t wifi_mgr_softap_sta_count(void)
+{
+    wifi_sta_list_t list = {0};
+    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK) return 0;
+    return (uint8_t)list.num;
+}
+
+/* Enable/refresh internet passthrough (NAT) for hotspot clients when the AP is
+ * up AND the STA has an upstream IP. Also offers the STA's DNS to AP clients so
+ * names resolve. Idempotent; returns whether passthrough is active. */
+bool wifi_mgr_napt_refresh(void)
+{
+    if (!s_initialized || !s_ap_netif) { s_napt_on = false; return false; }
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&mode);
+    if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) { s_napt_on = false; return false; }
+
+    /* Upstream = STA associated with a real IP. */
+    esp_netif_ip_info_t sta_ip = {0};
+    bool upstream = (mode == WIFI_MODE_APSTA) && s_sta_netif
+                 && esp_netif_get_ip_info(s_sta_netif, &sta_ip) == ESP_OK
+                 && sta_ip.ip.addr != 0;
+    if (!upstream) { s_napt_on = false; return false; }
+
+    /* napt_enable is idempotent — safe to re-assert every status poll. */
+    if (esp_netif_napt_enable(s_ap_netif) != ESP_OK) { s_napt_on = false; return false; }
+
+    /* Do the DHCP/DNS reconfigure ONCE, on the off→on transition. Restarting the
+     * DHCP server on every poll (this is re-run ~1s from the hotspot status) would
+     * churn AP clients' leases. */
+    if (!s_napt_on) {
+        esp_netif_dns_info_t dns = {0};
+        if (esp_netif_get_dns_info(s_sta_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK
+            && dns.ip.u_addr.ip4.addr != 0) {
+            uint8_t offer = 1;
+            esp_netif_dhcps_stop(s_ap_netif);
+            esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns);
+            esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                   ESP_NETIF_DOMAIN_NAME_SERVER, &offer, sizeof(offer));
+            esp_netif_dhcps_start(s_ap_netif);
+        }
+        ESP_LOGI(TAG, "Hotspot internet passthrough (NAT) on");
+    }
+
+    s_napt_on = true;
+    return true;
+}
+
+/* True while hotspot clients are being NAT'd out to the internet. */
+bool wifi_mgr_softap_internet_shared(void)
+{
+    return s_napt_on;
 }
 
 esp_err_t wifi_mgr_scan(wifi_mgr_scan_cb_t callback)

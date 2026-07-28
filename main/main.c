@@ -26,6 +26,7 @@
 #include "ble_scan.h"
 #include "ble_conn.h"
 #include "ble_spam.h"
+#include "ble_nus.h"
 #include "ieee802154_sniff.h"
 #include "esp_now_link.h"
 #include "m1_rpc.h"
@@ -52,7 +53,7 @@ static const char *TAG = "main";
                      M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
                      M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
                      M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
-                     M1_CAP_KARMA)
+                     M1_CAP_KARMA     | M1_CAP_SOFTAP)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
@@ -148,7 +149,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 0; v.patch = 3;
+    v.major = 1; v.minor = 2; v.patch = 2;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -298,9 +299,15 @@ static void handle_wifi_connect(const m1_rpc_header_t *hdr,
     cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
 
     /* Put the radio back in a clean STA state before associating, so a prior
-     * feature that pinned the channel / enabled monitor mode can't block us. */
+     * feature that pinned the channel / enabled monitor mode can't block us.
+     * PRESERVE a running SoftAP: if the WiFi Hotspot is up (AP/APSTA), use APSTA
+     * so joining a network doesn't tear the hotspot down — and so NAT can bridge
+     * hotspot clients out to this upstream link. */
     esp_wifi_set_promiscuous(false);
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    wifi_mode_t cur_mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&cur_mode);
+    esp_wifi_set_mode((cur_mode == WIFI_MODE_AP || cur_mode == WIFI_MODE_APSTA)
+                      ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
 
     /* Kick off the association ASYNCHRONOUSLY and answer immediately. Blocking
@@ -733,6 +740,65 @@ static void handle_ble_spam_start(const m1_rpc_header_t *hdr,
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
 
+/* Bluetooth Direct: start/stop advertising the NUS RPC service (M1 toggle). */
+static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
+                               const uint8_t *payload, uint16_t len)
+{
+    uint8_t enable = (len >= 1) ? payload[0] : 0;
+    esp_err_t err;
+    if (enable) {
+        err = ble_nus_adv_start();
+    } else {
+        ble_nus_adv_stop();
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* ---------- SoftAP ("WiFi Hotspot") ---------- */
+
+/* payload: [channel:1][ssid\0][pass\0] — bring up a real WiFi AP the phone can
+ * join (no router needed) and reach the RPC server over. */
+static void handle_softap_start(const m1_rpc_header_t *hdr,
+                                const uint8_t *payload, uint16_t len)
+{
+    if (len < 3) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint8_t channel = payload[0];
+    const char *ssid = (const char *)&payload[1];
+    size_t maxs = (size_t)len - 1;
+    size_t ssid_len = strnlen(ssid, maxs);
+    if (ssid_len == 0 || ssid_len + 1 >= maxs) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+    const char *pass = ssid + ssid_len + 1;   /* null-terminated within payload */
+    esp_err_t err = wifi_mgr_softap_start(ssid, pass, channel);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_softap_stop(const m1_rpc_header_t *hdr)
+{
+    esp_err_t err = wifi_mgr_softap_stop();
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_softap_sta_list(const m1_rpc_header_t *hdr)
+{
+    /* Self-heal NAT: (re)enable it if the AP + an upstream STA link are both up.
+     * The M1 polls this ~1s while the Hotspot menu is open, so passthrough turns
+     * on as soon as the conditions are met, regardless of the order the hotspot
+     * and WiFi were brought up. Idempotent. */
+    wifi_mgr_napt_refresh();
+
+    uint8_t resp[2];
+    resp[0] = wifi_mgr_softap_sta_count();               /* connected clients */
+    resp[1] = wifi_mgr_softap_internet_shared() ? 1 : 0; /* internet passthrough */
+    send_resp(hdr->msg_id, resp, sizeof(resp));
+}
+
 /* ---------- Screen push (M1 -> ESP -> qMonstatek) ---------- */
 
 static void handle_screen_push(const m1_rpc_header_t *hdr,
@@ -796,6 +862,17 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_WIFI_GET_STATUS:
         handle_wifi_status(hdr);
+        break;
+
+    /* SoftAP ("WiFi Hotspot") */
+    case M1_RPC_SOFTAP_START:
+        handle_softap_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_SOFTAP_STOP:
+        handle_softap_stop(hdr);
+        break;
+    case M1_RPC_SOFTAP_STA_LIST:
+        handle_softap_sta_list(hdr);
         break;
 
     /* Offensive WiFi */
@@ -912,6 +989,9 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_BLE_SPAM_START:
         handle_ble_spam_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_RPC_ADV:
+        handle_ble_rpc_adv(hdr, payload, payload_len);
         break;
     case M1_RPC_BLE_SPAM_STOP:
         ble_spam_stop();
