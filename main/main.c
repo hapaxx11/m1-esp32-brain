@@ -149,7 +149,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 2; v.patch = 3;
+    v.major = 1; v.minor = 2; v.patch = 4;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -205,6 +205,15 @@ static void handle_sntp_sync(const m1_rpc_header_t *hdr)
 
 static void handle_wifi_scan(const m1_rpc_header_t *hdr)
 {
+    /* A scan needs a STA-capable, started radio. If we're AP-only (hotspot with
+     * no STA), temporarily add STA (APSTA) so the scan works while keeping the AP
+     * up; esp_wifi_start() is a harmless no-op if already running. Without this,
+     * scanning while the hotspot is on returns nothing. */
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_wifi_get_mode(&mode);
+    if (mode == WIFI_MODE_AP) esp_wifi_set_mode(WIFI_MODE_APSTA);
+    esp_wifi_start();
+
     wifi_scan_config_t scan_cfg = { .show_hidden = true };
     if (esp_wifi_scan_start(&scan_cfg, true) != ESP_OK) {
         send_nak(hdr->msg_id, M1_RPC_ERR_BUSY);
