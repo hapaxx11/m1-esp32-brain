@@ -37,6 +37,12 @@ static const char *TAG = "rpc_srv";
 
 static int s_listen_fd = -1;
 static int s_client_fd = -1;
+/* Last inbound activity from the TCP client. qM clients ping every few seconds,
+ * so a long silence means the client vanished without a clean FIN (WiFi dropped,
+ * app killed) — a half-open socket that recv() never wakes for. The control loop
+ * reaps it after RPC_CLIENT_IDLE_TIMEOUT_MS so link_active can't stay stuck true. */
+static TickType_t s_client_last_rx = 0;
+#define RPC_CLIENT_IDLE_TIMEOUT_MS  30000
 
 /* Relay queue: qMonstatek command frames the ESP can't answer locally are
  * queued here for the M1 to pull via QMON_POLL. */
@@ -488,6 +494,7 @@ static void accept_new(void)
     xSemaphoreGive(s_udp_mutex);
 
     s_client_fd = fd;
+    s_client_last_rx = xTaskGetTickCount();   /* arm the idle watchdog */
     s_active = CLIENT_TCP;               /* TCP is now the active RPC client */
     wifi_mgr_set_ps_active(true);        /* low-latency while a client is connected */
     ESP_LOGI(TAG, "Client connected (fd=%d)", fd);
@@ -557,6 +564,18 @@ static void rpc_control_task(void *arg)
         /* Every tick: push any M1-produced control responses to the client. */
         drain_out_q();
 
+        /* Reap a client that has gone silent — a half-open TCP socket recv()
+         * never wakes for. Without this, s_client_fd stays >= 0 forever and the
+         * M1 keeps reporting link_active (the false "connected to mobile app
+         * over WiFi"). qM clients ping well within the timeout. */
+        if (s_client_fd >= 0 &&
+            (xTaskGetTickCount() - s_client_last_rx) > pdMS_TO_TICKS(RPC_CLIENT_IDLE_TIMEOUT_MS)) {
+            ESP_LOGW(TAG, "Client idle > %d ms — reaping half-open session", RPC_CLIENT_IDLE_TIMEOUT_MS);
+            s_last_exit_reason = RPC_EXIT_RECV_SYNC;
+            close_client();
+            parser_reset(&parser);
+        }
+
         if (r <= 0) continue;   /* timeout (0) or error (<0, re-loop) */
 
         if (FD_ISSET(s_listen_fd, &rfds)) {
@@ -567,6 +586,7 @@ static void rpc_control_task(void *arg)
         if (s_client_fd >= 0 && FD_ISSET(s_client_fd, &rfds)) {
             int n = recv(s_client_fd, rbuf, sizeof(rbuf), 0);
             if (n > 0) {
+                s_client_last_rx = xTaskGetTickCount();   /* client is alive */
                 for (int i = 0; i < n; i++) parser_feed(&parser, rbuf[i]);
             } else if (n == 0) {
                 s_last_exit_reason = RPC_EXIT_RECV_SYNC;
