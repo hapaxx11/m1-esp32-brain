@@ -179,6 +179,17 @@ ble_nus_adv_start(void)
     if (err != ESP_OK)
         return err;
 
+    /* Already have a Direct client? Do NOT (re)start advertising. Direct is
+     * one-client-at-a-time, and starting a connectable advertisement while a
+     * client is connected tears down the live link on this controller — that is
+     * what dropped the phone every time Bad-BT was closed (the HID-deinit restore
+     * path calls this while the phone is still connected). Latch the intent so
+     * the disconnect handler re-advertises once the client actually leaves. */
+    if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+        s_advertising = true;
+        return ESP_OK;
+    }
+
     /* The host may not be synced yet on the very first call; infer_auto fails
      * until sync, in which case we mark intent and (re)start on the sync path
      * via the GAP restart. Try now; NimBLE returns an error we can log. */
