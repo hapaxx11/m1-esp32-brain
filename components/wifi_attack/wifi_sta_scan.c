@@ -7,6 +7,7 @@
  */
 
 #include "wifi_sta_scan.h"
+#include "wifi_manager.h"   /* wifi_mgr_disconnect/connect_async — disarm auto-reconnect */
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_mac.h"
@@ -35,6 +36,7 @@ typedef struct {
 
 static uint8_t          s_target_bssid[6];
 static bool             s_running;
+static bool             s_was_connected;   /* STA link dropped for the sniff, restore on stop */
 static wifi_sta_dev_t   s_devs[STA_SCAN_MAX_DEVS];
 static int              s_dev_count;
 static SemaphoreHandle_t s_lock;
@@ -155,8 +157,25 @@ esp_err_t wifi_sta_scan_start(const uint8_t bssid[6], uint8_t channel, uint16_t 
 
     esp_err_t err;
 
+    /* If the STA is connected, the driver pins the radio to the connection's
+     * channel and the esp_wifi_set_channel() below won't stick — promiscuous
+     * would sniff the wrong channel and find no stations for the target BSSID.
+     * Drop the link for the duration of the sniff; wifi_sta_scan_stop() restores
+     * it (esp_wifi_connect reuses the stored config). Over USB this is seamless;
+     * a qMonstatek-over-WiFi session would blip for the sniff. */
+    wifi_ap_record_t apinfo;
+    s_was_connected = (esp_wifi_sta_get_ap_info(&apinfo) == ESP_OK);
+    if (s_was_connected) {
+        /* wifi_mgr_disconnect() DISARMS the manager's auto-reconnect first — a raw
+         * esp_wifi_disconnect() would fire STA_DISCONNECTED and the manager would
+         * immediately esp_wifi_connect() again, snapping the radio back to the AP
+         * channel and defeating the sniff (the bug that left client lists empty). */
+        wifi_mgr_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(200));   /* let the radio leave the AP channel */
+    }
+
     err = esp_wifi_set_promiscuous(true);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "set_promiscuous: %s", esp_err_to_name(err)); return err; }
+    if (err != ESP_OK) { ESP_LOGE(TAG, "set_promiscuous: %s", esp_err_to_name(err)); goto fail; }
 
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA,
@@ -182,6 +201,8 @@ esp_err_t wifi_sta_scan_start(const uint8_t bssid[6], uint8_t channel, uint16_t 
 
 fail:
     esp_wifi_set_promiscuous(false);
+    /* Restore the STA link we dropped above if start failed. */
+    if (s_was_connected) { s_was_connected = false; wifi_mgr_connect_async(); }
     return err;
 }
 
@@ -202,6 +223,13 @@ void wifi_sta_scan_stop(void)
 
     /* Restore normal STA mode so the WiFi link works afterward. */
     esp_wifi_set_mode(WIFI_MODE_STA);
+
+    /* Reconnect if we dropped the STA link to free the radio for the sniff.
+     * connect_async re-arms the manager's auto-reconnect + reuses the stored AP. */
+    if (s_was_connected) {
+        s_was_connected = false;
+        wifi_mgr_connect_async();
+    }
 
     ESP_LOGI(TAG, "STA scan stopped (%d stations)", s_dev_count);
 }

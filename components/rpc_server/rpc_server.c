@@ -42,7 +42,7 @@ static int s_client_fd = -1;
  * app killed) — a half-open socket that recv() never wakes for. The control loop
  * reaps it after RPC_CLIENT_IDLE_TIMEOUT_MS so link_active can't stay stuck true. */
 static TickType_t s_client_last_rx = 0;
-#define RPC_CLIENT_IDLE_TIMEOUT_MS  30000
+#define RPC_CLIENT_IDLE_TIMEOUT_MS  10000
 
 /* Relay queue: qMonstatek command frames the ESP can't answer locally are
  * queued here for the M1 to pull via QMON_POLL. */
@@ -285,11 +285,19 @@ esp_err_t rpc_server_broadcast(uint8_t cmd,
     return rpc_server_send(cmd, 0, payload, payload_len);
 }
 
+uint8_t rpc_server_client_status(void)
+{
+    uint8_t status = 0;
+    if (s_client_fd >= 0) status |= RPC_SERVER_CLIENT_TCP;
+    if (s_ble_connected)  status |= RPC_SERVER_CLIENT_BLE;
+    return status;
+}
+
 bool rpc_server_client_connected(void)
 {
     /* A BLE (Bluetooth Direct) client counts too, so the M1 relays to it even
      * when WiFi is down. */
-    return s_client_fd >= 0 || s_ble_connected;
+    return rpc_server_client_status() != 0;
 }
 
 /* Queue a raw qMonstatek command frame for the M1 to pull via QMON_POLL. */

@@ -35,7 +35,16 @@ typedef struct {
 /* Initialize RPC server (creates TCP listener task) */
 esp_err_t rpc_server_init(const rpc_server_config_t *config);
 
-/* Check if a client is connected */
+/* Live qMonstatek-client transport bits. A USB-connected desktop can use these
+ * to report whether a separate mobile/remote app is connected over Wi-Fi or
+ * Bluetooth Direct, without mistaking one transport for the other. */
+#define RPC_SERVER_CLIENT_TCP  0x01u
+#define RPC_SERVER_CLIENT_BLE  0x02u
+
+/* Return the active client transport bits. */
+uint8_t rpc_server_client_status(void);
+
+/* Check whether any qMonstatek client is connected. */
 bool rpc_server_client_connected(void);
 
 /* Send a frame to connected client. Thread-safe. */

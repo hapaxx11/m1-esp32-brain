@@ -50,21 +50,36 @@ int ble_host_own_addr_type(void);
  * (re)apply the name and (re)start advertising. Does not disturb any active
  * scan sharing the same host.
  *
- * @param device_name  Complete local name advertised (NULL -> "ESP32-C6 KB").
+ * @param device_name  Complete local name advertised (NULL -> "ESP32-C6 KB"),
+ *                     truncated to 29 characters so it always fits in BLE scan
+ *                     response data alongside the HID advertisement.
  * @return ESP_OK on success, error code otherwise.
  */
 esp_err_t ble_hid_start(const char *device_name);
 
 /**
- * Stop advertising and disconnect any active central. The NimBLE host stays
- * initialized so ble_hid_start() can resume quickly.
+ * Stop advertising and request disconnect of any active central. The NimBLE
+ * host stays initialized so ble_hid_start() can resume quickly.
  */
 void ble_hid_stop(void);
 
 /**
- * @return true once a central has connected.
+ * Stop HID and wait for the GAP disconnect event to complete. This is used by
+ * Bad-BT's exit RPC so the next BLE app cannot start against a half-closed HID
+ * link. A timeout leaves the current state intact and reports failure.
+ *
+ * @param timeout_ms Maximum time to wait for the disconnect event.
+ * @return ESP_OK only once no HID connection remains.
+ */
+esp_err_t ble_hid_stop_and_wait(uint32_t timeout_ms);
+
+/**
+ * @return true once a central has established the BLE link.
  */
 bool ble_hid_is_connected(void);
+
+/** @return true only after encryption and HID input notifications are ready. */
+bool ble_hid_is_ready(void);
 
 /**
  * Send a single 8-byte HID keyboard report [modifier, 0x00, k0..k5] as a

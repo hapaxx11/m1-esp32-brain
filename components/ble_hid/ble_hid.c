@@ -31,6 +31,7 @@
 #include "ble_nus.h"
 
 #define TAG "BLE_HID"
+#define HID_MAX_ADV_NAME_LEN  29  /* scan response: AD length + type fit in 31 bytes */
 
 /* Provided by NimBLE's store/config module (no public header, matches the
  * ESP-IDF bleprph example which forward-declares it the same way). */
@@ -122,9 +123,17 @@ static bool     s_encrypted        = false;
 static bool     s_input_subscribed = false;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
-static char     s_device_name[32] = "ESP32-C6 KB";
+static char     s_device_name[HID_MAX_ADV_NAME_LEN + 1] = "ESP32-C6 KB";
 
-static void ble_hid_advertise(void);
+/* A HID stop is asynchronous at the GAP layer.  Keep a private completion
+ * semaphore so the Bad-BT exit RPC can wait for the actual disconnect event
+ * instead of ACKing while Windows still owns the keyboard connection. */
+static StaticSemaphore_t s_stop_sem_buf;
+static SemaphoreHandle_t s_stop_sem;
+static bool              s_stop_waiting;
+
+
+static int ble_hid_advertise(void);
 
 /* Defined by the scan module (same component). Invoked from the shared host
  * sync callback so a scan requested before sync can start once the host is
@@ -346,6 +355,14 @@ ble_hid_gap_event(struct ble_gap_event *event, void *arg)
             s_encrypted = false;          /* not usable until encrypted + subscribed */
             s_input_subscribed = false;
             ESP_LOGI(TAG, "connected; conn_handle=%d", s_conn_handle);
+
+            /* Initiate security for both a new pair and a known bonded host.
+             * Relying on the central to request encryption works on some hosts
+             * but leaves others connected without an encrypted HID link after
+             * an app restart. */
+            int rc = ble_gap_security_initiate(s_conn_handle);
+            if (rc != 0 && rc != BLE_HS_EALREADY)
+                ESP_LOGW(TAG, "security initiate failed; rc=%d", rc);
         } else {
             ESP_LOGW(TAG, "connect failed; status=%d, re-advertising",
                      event->connect.status);
@@ -361,13 +378,20 @@ ble_hid_gap_event(struct ble_gap_event *event, void *arg)
         s_encrypted = false;
         s_input_subscribed = false;
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        ble_hid_advertise();
+        if (s_stop_waiting) {
+            s_stop_waiting = false;
+            if (s_stop_sem != NULL)
+                xSemaphoreGive(s_stop_sem);
+        }
+        if (s_hid_enabled)
+            ble_hid_advertise();
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         ESP_LOGI(TAG, "adv complete; reason=%d, restarting",
                  event->adv_complete.reason);
-        ble_hid_advertise();
+        if (s_hid_enabled && !s_connected)
+            ble_hid_advertise();
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -388,14 +412,14 @@ ble_hid_gap_event(struct ble_gap_event *event, void *arg)
         if (event->enc_change.status == 0) {
             s_encrypted = true;
         } else {
-            /* Encryption failed — almost always a stale/mismatched bond (the
-             * host kept a bond from an earlier flash; ours is gone). Delete the
-             * peer so the next connection performs a FRESH pairing instead of
-             * looping connect -> encrypt-fail -> disconnect -> re-advertise. */
+            /* Do not delete a peer record merely because one encryption attempt
+             * failed.  The device name is mutable but the bonded keyboard
+             * identity is not; deleting its key here is what made a harmless
+             * name edit require the user to forget the keyboard in Windows.
+             * Repeat-pairing has its own explicit callback below. */
             s_encrypted = false;
-            struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0)
-                ble_store_util_delete_peer(&desc.peer_id_addr);
+            ESP_LOGW(TAG, "encryption failed; preserving existing bond (status=%d)",
+                     event->enc_change.status);
         }
         return 0;
 
@@ -421,12 +445,15 @@ ble_hid_gap_event(struct ble_gap_event *event, void *arg)
  * Advertising
  * ======================================================================== */
 
-static void
+static int
 ble_hid_advertise(void)
 {
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
     int rc;
+
+    if (!s_hid_enabled || s_connected || !s_synced)
+        return 0;
 
     memset(&fields, 0, sizeof fields);
 
@@ -440,10 +467,6 @@ ble_hid_advertise(void)
     fields.appearance = HID_APPEARANCE_KEYBOARD;
     fields.appearance_is_present = 1;
 
-    fields.name = (uint8_t *)s_device_name;
-    fields.name_len = strlen(s_device_name);
-    fields.name_is_complete = 1;
-
     /* Advertise the HID service UUID (0x1812). */
     fields.uuids16 = (ble_uuid16_t[]) {
         BLE_UUID16_INIT(HID_SVC_UUID)
@@ -454,7 +477,22 @@ ble_hid_advertise(void)
     rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_set_fields failed; rc=%d", rc);
-        return;
+        return rc;
+    }
+
+    /* The primary advertisement already carries flags, TX power, appearance,
+     * and the HID UUID. Putting a user-editable name there limits it to about
+     * 15 characters; longer names made advertising fail silently. Keep the
+     * name in the scan response, where all 29 supported characters fit. */
+    struct ble_hs_adv_fields rsp_fields;
+    memset(&rsp_fields, 0, sizeof rsp_fields);
+    rsp_fields.name = (uint8_t *)s_device_name;
+    rsp_fields.name_len = strlen(s_device_name);
+    rsp_fields.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv_rsp_set_fields failed; rc=%d", rc);
+        return rc;
     }
 
     memset(&adv_params, 0, sizeof adv_params);
@@ -465,9 +503,10 @@ ble_hid_advertise(void)
                            &adv_params, ble_hid_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_start failed; rc=%d", rc);
-        return;
+        return rc;
     }
     ESP_LOGI(TAG, "advertising as \"%s\"", s_device_name);
+    return 0;
 }
 
 /* ========================================================================
@@ -632,6 +671,9 @@ ble_host_ensure_started(void)
     /* Persistent bond store (weak default provided by nimble store config). */
     ble_store_config_init();
 
+    if (s_stop_sem == NULL)
+        s_stop_sem = xSemaphoreCreateBinaryStatic(&s_stop_sem_buf);
+
     s_host_inited = true;
     nimble_port_freertos_init(ble_hid_host_task);
 
@@ -670,7 +712,8 @@ ble_hid_start(const char *device_name)
      * now. Otherwise ble_host_on_sync() will advertise once sync completes. */
     if (s_synced && !s_connected) {
         ble_gap_adv_stop();
-        ble_hid_advertise();
+        if (ble_hid_advertise() != 0)
+            return ESP_FAIL;
     }
 
     if (s_report_input_handle == 0)
@@ -683,27 +726,70 @@ ble_hid_start(const char *device_name)
 void
 ble_hid_stop(void)
 {
+    (void)ble_hid_stop_and_wait(0);
+}
+
+esp_err_t
+ble_hid_stop_and_wait(uint32_t timeout_ms)
+{
     if (!s_host_inited)
-        return;
+        return ESP_OK;
 
+    /* Disable intent before stopping GAP so neither ADV_COMPLETE nor the
+     * disconnect callback can revive this advertiser. */
     s_hid_enabled = false;
-    ble_gap_adv_stop();
+    int rc = ble_gap_adv_stop();
+    if (rc != 0 && rc != BLE_HS_EALREADY)
+        ESP_LOGW(TAG, "adv_stop during HID teardown; rc=%d", rc);
 
-    if (s_connected && s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (!s_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        s_connected = false;
+        s_encrypted = false;
+        s_input_subscribed = false;
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        return ESP_OK;
+    }
 
-    s_connected = false;
-    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    if (timeout_ms > 0 && s_stop_sem != NULL)
+        xSemaphoreTake(s_stop_sem, 0);  /* discard a stale completion */
+    s_stop_waiting = timeout_ms > 0;
+
+    rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        s_stop_waiting = false;
+        ESP_LOGW(TAG, "terminate HID connection failed; rc=%d", rc);
+        return ESP_FAIL;
+    }
+
+    if (timeout_ms == 0)
+        return ESP_OK;
+
+    if (s_stop_sem == NULL ||
+        xSemaphoreTake(s_stop_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        /* A GAP callback may have run immediately before the wait was entered. */
+        if (!s_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
+            return ESP_OK;
+        s_stop_waiting = false;
+        ESP_LOGW(TAG, "timed out waiting for HID disconnect");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
 }
 
 bool
 ble_hid_is_connected(void)
 {
-    /* Report "connected" to the M1 only when the keyboard is actually usable:
-     * link up AND encrypted AND the host subscribed to the input report. This
-     * gates ble_hid_wait_connect() so the M1 doesn't start typing into a host
-     * that will drop the notifications. */
-    return s_connected && s_encrypted && s_input_subscribed;
+    return s_connected && s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
+bool
+ble_hid_is_ready(void)
+{
+    /* A host can report a connected keyboard slightly before it has completed
+     * encryption and subscribed to the input-report characteristic.  Keep that
+     * stricter state separate from the visible link state. */
+    return ble_hid_is_connected() && s_encrypted && s_input_subscribed;
 }
 
 esp_err_t

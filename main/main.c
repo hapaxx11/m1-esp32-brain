@@ -82,6 +82,13 @@ static void handle_now_recv_get(const m1_rpc_header_t *hdr);
 
 static uint8_t s_rx_buf[M1_RPC_DMA_MAX_LEN];
 
+/* NimBLE has one legacy advertising procedure. Bluetooth Direct (NUS) and
+ * Bad-BT (HID) therefore cannot both own it. Keep the user's Direct setting
+ * as intent so it resumes after Bad-BT stops instead of competing every few
+ * seconds in GAP ADV_COMPLETE callbacks. */
+static bool s_ble_direct_enabled = false;
+static bool s_ble_direct_restore_after_hid = false;
+
 /* ---------- Frame send helpers (ESP32 -> M1) ---------- */
 
 static void send_frame(m1_rpc_msgtype_t type, uint16_t msg_id,
@@ -149,7 +156,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 2; v.patch = 5;
+    v.major = 1; v.minor = 2; v.patch = 11;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -636,6 +643,16 @@ static void handle_ble_hid_init(const m1_rpc_header_t *hdr,
         memcpy(name, payload, n);
         name[n] = 0;
     }
+
+    /* NimBLE provides one legacy advertising slot.  Every other advertiser
+     * keeps its own restart callback, so merely stopping the currently visible
+     * packet is insufficient: its callback can claim the slot again a moment
+     * later.  Disable every competing owner's intent before Bad-BT starts. */
+    s_ble_direct_restore_after_hid = s_ble_direct_enabled;
+    if (s_ble_direct_enabled)
+        ble_nus_adv_stop();
+    ble_adv_stop();
+    ble_spam_stop();
     esp_err_t err = ble_hid_start(name);
     if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
@@ -656,8 +673,10 @@ static void handle_ble_hid_key(const m1_rpc_header_t *hdr,
 
 static void handle_ble_hid_status(const m1_rpc_header_t *hdr)
 {
-    uint8_t connected = ble_hid_is_connected() ? 1 : 0;
-    send_resp(hdr->msg_id, &connected, 1);
+    /* bit 0 = link established; bit 1 = encrypted HID input is subscribed. */
+    uint8_t status = (ble_hid_is_connected() ? 0x01 : 0x00) |
+                     (ble_hid_is_ready()     ? 0x02 : 0x00);
+    send_resp(hdr->msg_id, &status, 1);
 }
 
 /* ---------- BLE scan (native NimBLE central) ---------- */
@@ -747,8 +766,13 @@ static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
     uint8_t enable = (len >= 1) ? payload[0] : 0;
     esp_err_t err;
     if (enable) {
+        s_ble_direct_enabled = true;
+        s_ble_direct_restore_after_hid = false;
+        ble_hid_stop();
         err = ble_nus_adv_start();
     } else {
+        s_ble_direct_enabled = false;
+        s_ble_direct_restore_after_hid = false;
         ble_nus_adv_stop();
         err = ESP_OK;
     }
@@ -959,8 +983,17 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         handle_ble_hid_key(hdr, payload, payload_len);
         break;
     case M1_RPC_BLE_HID_DEINIT:
-        ble_hid_stop();
-        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        /* HID teardown is asynchronous in NimBLE. Wait for its disconnect
+         * event before ACKing so the next BLE app never starts against a
+         * still-connected keyboard. */
+        if (ble_hid_stop_and_wait(1500) == ESP_OK) {
+            if (s_ble_direct_restore_after_hid && s_ble_direct_enabled)
+                ble_nus_adv_start();
+            s_ble_direct_restore_after_hid = false;
+            send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        } else {
+            send_nak(hdr->msg_id, M1_RPC_ERR_TIMEOUT);
+        }
         break;
     case M1_RPC_BLE_HID_STATUS:
         handle_ble_hid_status(hdr);
@@ -1054,8 +1087,8 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         handle_qmon_resp(hdr, payload, payload_len);
         break;
     case M1_RPC_RPC_STATUS: {
-        uint8_t connected = rpc_server_client_connected() ? 1 : 0;
-        send_resp(hdr->msg_id, &connected, 1);
+        uint8_t status = rpc_server_client_status();
+        send_resp(hdr->msg_id, &status, 1);
         break;
     }
 
