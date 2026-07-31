@@ -39,7 +39,7 @@ static uint16_t s_mtu       = 23;      /* negotiated ATT MTU (BLE default until 
 static bool     s_tx_subscribed = false;
 static bool     s_advertising   = false;
 static uint8_t  s_own_addr_type = 0;
-static char     s_name[16]      = "M1-BLE";
+static char     s_name[32]      = "M1-BLE";
 
 static int nus_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -120,6 +120,24 @@ ble_nus_connected(void)
 }
 
 bool
+ble_nus_is_advertising(void)
+{
+    return s_advertising && s_conn == BLE_HS_CONN_HANDLE_NONE;
+}
+
+/* Set the Bluetooth-Direct (NUS) advertised name. Kept SEPARATE from the Bad-BT
+ * HID name so the two identities never share a string. The host pushes this via
+ * the extended BLE_RPC_ADV payload. Takes effect on the next ble_nus_adv_start()
+ * (which also asserts it into the GAP 0x2A00 characteristic). */
+void
+ble_nus_set_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0')
+        return;
+    strlcpy(s_name, name, sizeof(s_name));
+}
+
+bool
 ble_nus_send(const uint8_t *data, uint16_t len)
 {
     if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_tx_subscribed || data == NULL)
@@ -188,6 +206,12 @@ ble_nus_adv_start(void)
     rc = ble_gap_adv_rsp_set_fields(&rsp);
     if (rc != 0)
         ESP_LOGW(TAG, "adv_rsp_set_fields failed; rc=%d (name only)", rc);
+
+    /* Assert OUR name into the global GAP Device Name (0x2A00). NimBLE has one
+     * such characteristic for the whole host; Bad-BT/HID also writes it. Setting
+     * it here means a central that reads 0x2A00 after connecting to Direct sees
+     * the Direct name, not a leftover Bad-BT name — the decoupling fix. */
+    ble_svc_gap_device_name_set(s_name);
 
     struct ble_gap_adv_params adv_params;
     memset(&adv_params, 0, sizeof adv_params);

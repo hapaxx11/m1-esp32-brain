@@ -455,6 +455,11 @@ ble_hid_advertise(void)
     if (!s_hid_enabled || s_connected || !s_synced)
         return 0;
 
+    /* Re-assert OUR name into the shared GAP Device Name (0x2A00) every time we
+     * (re)advertise, so a prior Bluetooth-Direct/NUS name can't linger on the
+     * one global characteristic and get read back as the keyboard's name. */
+    ble_svc_gap_device_name_set(s_device_name);
+
     memset(&fields, 0, sizeof fields);
 
     /* General discoverable + BLE-only (BR/EDR unsupported). */
@@ -790,6 +795,13 @@ ble_hid_is_ready(void)
      * encryption and subscribed to the input-report characteristic.  Keep that
      * stricter state separate from the visible link state. */
     return ble_hid_is_connected() && s_encrypted && s_input_subscribed;
+}
+
+bool
+ble_hid_is_advertising(void)
+{
+    /* Bad-BT is advertising when it is enabled, synced, and not yet connected. */
+    return s_hid_enabled && s_synced && !s_connected;
 }
 
 esp_err_t

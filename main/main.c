@@ -156,7 +156,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 2; v.patch = 11;
+    v.major = 1; v.minor = 2; v.patch = 12;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -766,6 +766,17 @@ static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
     uint8_t enable = (len >= 1) ? payload[0] : 0;
     esp_err_t err;
     if (enable) {
+        /* Optional name follows the enable byte: [enable:1][name bytes].
+         * len==1 keeps the current name; a name here is the Direct identity,
+         * kept fully separate from the Bad-BT HID name. */
+        if (len > 1) {
+            char name[32];
+            uint16_t n = (uint16_t)(len - 1);
+            if (n > sizeof(name) - 1) n = sizeof(name) - 1;
+            memcpy(name, &payload[1], n);
+            name[n] = '\0';
+            ble_nus_set_name(name);
+        }
         s_ble_direct_enabled = true;
         s_ble_direct_restore_after_hid = false;
         ble_hid_stop();
@@ -778,6 +789,17 @@ static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
     }
     if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+/* Report which BLE role(s) are currently active, for the host "BT Info" screen.
+ * One byte of flags — Direct (NUS) and Bad-BT (HID) are independent identities. */
+static void handle_ble_state(const m1_rpc_header_t *hdr)
+{
+    uint8_t flags = (ble_nus_is_advertising() ? 0x01 : 0x00) |
+                    (ble_nus_connected()      ? 0x02 : 0x00) |
+                    (ble_hid_is_advertising() ? 0x04 : 0x00) |
+                    (ble_hid_is_connected()   ? 0x08 : 0x00);
+    send_resp(hdr->msg_id, &flags, 1);
 }
 
 /* ---------- SoftAP ("WiFi Hotspot") ---------- */
@@ -1025,6 +1047,9 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_BLE_RPC_ADV:
         handle_ble_rpc_adv(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_STATE:
+        handle_ble_state(hdr);
         break;
     case M1_RPC_BLE_SPAM_STOP:
         ble_spam_stop();

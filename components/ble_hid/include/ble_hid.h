@@ -81,6 +81,9 @@ bool ble_hid_is_connected(void);
 /** @return true only after encryption and HID input notifications are ready. */
 bool ble_hid_is_ready(void);
 
+/** @return true while Bad-BT is advertising (enabled, synced, not yet connected). */
+bool ble_hid_is_advertising(void);
+
 /**
  * Send a single 8-byte HID keyboard report [modifier, 0x00, k0..k5] as a
  * notification on the Report Input characteristic. The caller is responsible

@@ -35,6 +35,13 @@ void      ble_nus_adv_stop(void);
 /* True while a phone is connected over the NUS link. */
 bool ble_nus_connected(void);
 
+/* True while the Direct/NUS link is advertising (enabled and not yet connected). */
+bool ble_nus_is_advertising(void);
+
+/* Set the Direct/NUS advertised name (independent of the Bad-BT HID name).
+ * Applied on the next ble_nus_adv_start(); ignored if name is NULL/empty. */
+void ble_nus_set_name(const char *name);
+
 /* Called from the shared NimBLE host sync callback (ble_host_on_sync) so a
  * pending advertise-start requested before sync completes gets applied. */
 void ble_nus_on_host_synced(void);
