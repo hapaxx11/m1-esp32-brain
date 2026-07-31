@@ -12,6 +12,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"      /* esp_read_mac — derive the HID static-random address */
 
 #include "nvs_flash.h"
 
@@ -123,6 +124,13 @@ static bool     s_encrypted        = false;
 static bool     s_input_subscribed = false;
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
+/* Bad-BT/HID advertises on its OWN stable static-random address, distinct from
+ * the public address that Bluetooth-Direct (NUS) uses. This keeps the PC's HID
+ * bond tied to a different BLE identity, so the PC no longer auto-reconnects to
+ * (and camps) the Direct connection at boot. MAC-derived => stable across
+ * reboots so the bonded keyboard host still reconnects. */
+static uint8_t  s_hid_rnd_addr[6];
+static bool     s_hid_addr_ready = false;
 static char     s_device_name[HID_MAX_ADV_NAME_LEN + 1] = "ESP32-C6 KB";
 
 /* A HID stop is asynchronous at the GAP layer.  Keep a private completion
@@ -504,7 +512,11 @@ ble_hid_advertise(void)
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+    /* Advertise + bond on the HID static-random address (Bad-BT's own identity),
+     * so the PC's keyboard bond does not apply to the Direct/public address.
+     * Fall back to the public address if the random one couldn't be set. */
+    uint8_t own_addr = s_hid_addr_ready ? BLE_OWN_ADDR_RANDOM : s_own_addr_type;
+    rc = ble_gap_adv_start(own_addr, NULL, BLE_HS_FOREVER,
                            &adv_params, ble_hid_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_start failed; rc=%d", rc);
@@ -549,6 +561,23 @@ ble_host_on_sync(void)
     ESP_LOGI(TAG, "device addr %02x:%02x:%02x:%02x:%02x:%02x",
              addr_val[5], addr_val[4], addr_val[3],
              addr_val[2], addr_val[1], addr_val[0]);
+
+    /* Register the HID static-random address (Bad-BT's own identity). Derived
+     * from the BT MAC with the top two bits of the MSByte forced to 0b11 (the
+     * static-random requirement) and one LSB flipped so it can never equal the
+     * public address. Set once; NUS/Direct keeps using the public address. */
+    if (!s_hid_addr_ready) {
+        uint8_t mac[6] = {0};
+        if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK) {
+            memcpy(s_hid_rnd_addr, mac, 6);
+            s_hid_rnd_addr[5] |= 0xC0;   /* static-random: MSByte bits 7:6 = 11 */
+            s_hid_rnd_addr[0] ^= 0x01;   /* guarantee it differs from the public MAC */
+            if (ble_hs_id_set_rnd(s_hid_rnd_addr) == 0)
+                s_hid_addr_ready = true;
+            else
+                ESP_LOGW(TAG, "ble_hs_id_set_rnd failed; HID will use public addr");
+        }
+    }
 
     s_synced = true;
 
