@@ -39,14 +39,16 @@ extern "C" {
  * address distinct (HID/NUS/generic each pass a different salt). */
 void ble_static_rnd_addr(uint8_t out[6], uint8_t salt);
 
-/* Start a legacy-PDU extended advertisement on `instance` with static-random
- * `rnd_addr`. `connectable` selects ADV_IND vs ADV_NONCONN_IND. `rsp`/`rsp_len`
- * add a scan response (pass NULL/0 to skip). Reconfigures the instance each call
- * so name/address changes take effect. Returns 0 on success. */
-int  ble_extadv_start(uint8_t instance, bool connectable,
+/* Start an extended advertisement on `instance` with static-random `rnd_addr`.
+ * `connectable` sets connectable adv; `use_legacy` selects legacy PDUs (broadest
+ * scanner compat, non-connectable/scannable only) vs extended PDUs (needed for a
+ * connectable set when running MULTIPLE instances on the C6 — connectable legacy
+ * ADV_IND is not supported alongside other sets here). The complete AD payload
+ * (including the device name) goes in `adv`; there is no separate scan response.
+ * Reconfigures the instance each call so name/address changes take effect. */
+int  ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
                       const uint8_t rnd_addr[6],
                       const uint8_t *adv, uint8_t adv_len,
-                      const uint8_t *rsp, uint8_t rsp_len,
                       ble_gap_event_fn *cb, void *cb_arg);
 
 /* Stop the extended advertisement on `instance` (harmless if not advertising). */

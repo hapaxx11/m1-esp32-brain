@@ -466,17 +466,16 @@ ble_static_rnd_addr(uint8_t out[6], uint8_t salt)
 }
 
 int
-ble_extadv_start(uint8_t instance, bool connectable,
+ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
                  const uint8_t rnd_addr[6],
                  const uint8_t *adv, uint8_t adv_len,
-                 const uint8_t *rsp, uint8_t rsp_len,
                  ble_gap_event_fn *cb, void *cb_arg)
 {
     struct ble_gap_ext_adv_params params;
     memset(&params, 0, sizeof params);
     params.connectable   = connectable ? 1 : 0;
-    params.scannable     = (rsp && rsp_len) ? 1 : 0;
-    params.legacy_pdu    = 1;                    /* legacy PDUs => any BLE central connects */
+    params.scannable     = 0;                    /* full AD (name incl.) in primary */
+    params.legacy_pdu    = use_legacy ? 1 : 0;
     params.own_addr_type = BLE_OWN_ADDR_RANDOM;
     params.primary_phy   = BLE_HCI_LE_PHY_1M;
     params.secondary_phy = BLE_HCI_LE_PHY_1M;
@@ -504,14 +503,6 @@ ble_extadv_start(uint8_t instance, bool connectable,
     if ((rc = os_mbuf_append(d, adv, adv_len)) != 0) { os_mbuf_free_chain(d); return rc; }
     rc = ble_gap_ext_adv_set_data(instance, d);   /* consumes the mbuf */
     if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_data inst%u rc=%d", instance, rc); return rc; }
-
-    if (rsp && rsp_len) {
-        struct os_mbuf *r = os_msys_get_pkthdr(rsp_len, 0);
-        if (r == NULL) return BLE_HS_ENOMEM;
-        if ((rc = os_mbuf_append(r, rsp, rsp_len)) != 0) { os_mbuf_free_chain(r); return rc; }
-        rc = ble_gap_ext_adv_rsp_set_data(instance, r);
-        if (rc != 0) { ESP_LOGE(TAG, "ext_adv_rsp inst%u rc=%d", instance, rc); return rc; }
-    }
 
     rc = ble_gap_ext_adv_start(instance, 0, 0);   /* forever, unlimited events */
     if (rc != 0) ESP_LOGE(TAG, "ext_adv_start inst%u rc=%d", instance, rc);
@@ -549,25 +540,19 @@ ble_hid_advertise(void)
     fields.uuids16 = (ble_uuid16_t[]) { BLE_UUID16_INIT(HID_SVC_UUID) };
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
+    /* Name lives in the primary AD (extended PDU has room; no scan response). */
+    fields.name = (uint8_t *)s_device_name;
+    fields.name_len = strlen(s_device_name);
+    fields.name_is_complete = 1;
 
-    uint8_t adv[BLE_HS_ADV_MAX_SZ]; uint8_t adv_len = 0;
+    uint8_t adv[128]; uint8_t adv_len = 0;
     rc = ble_hs_adv_set_fields(&fields, adv, &adv_len, sizeof adv);
     if (rc != 0) { ESP_LOGE(TAG, "hid adv fields rc=%d", rc); return rc; }
 
-    /* Name goes in the scan response (all 29 chars fit; the primary is full). */
-    struct ble_hs_adv_fields rsp_fields;
-    memset(&rsp_fields, 0, sizeof rsp_fields);
-    rsp_fields.name = (uint8_t *)s_device_name;
-    rsp_fields.name_len = strlen(s_device_name);
-    rsp_fields.name_is_complete = 1;
-    uint8_t rbuf[BLE_HS_ADV_MAX_SZ]; uint8_t rlen = 0;
-    rc = ble_hs_adv_set_fields(&rsp_fields, rbuf, &rlen, sizeof rbuf);
-    if (rc != 0) { ESP_LOGE(TAG, "hid rsp fields rc=%d", rc); return rc; }
-
-    /* Advertise + bond on Bad-BT's OWN static-random address (ext-adv instance),
-     * separate from Direct's, so the PC's keyboard bond never matches Direct. */
-    rc = ble_extadv_start(BLE_ADV_INST_HID, true, s_hid_rnd_addr,
-                          adv, adv_len, rbuf, rlen, ble_hid_gap_event, NULL);
+    /* Extended connectable on Bad-BT's OWN static-random address, separate from
+     * Direct's, so the PC's keyboard bond never matches Direct. */
+    rc = ble_extadv_start(BLE_ADV_INST_HID, true, false, s_hid_rnd_addr,
+                          adv, adv_len, ble_hid_gap_event, NULL);
     if (rc == 0) ESP_LOGI(TAG, "advertising as \"%s\"", s_device_name);
     return rc;
 }

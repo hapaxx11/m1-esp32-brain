@@ -151,10 +151,10 @@ static void spam_once(uint8_t mode)
     for (int i = 0; i < 6; i++) rnd[i] = (uint8_t)esp_random();
     rnd[5] |= 0xC0;
 
-    /* Connectable (ADV_IND) so proximity-pair popups trigger; spam_gap_event
-     * drops any central that connects. Raw payload, no scan response. Runs on its
-     * own ext-adv instance so it no longer fights HID/NUS for a single slot. */
-    ble_extadv_start(BLE_ADV_INST_SPAM, true, rnd, adv, len, NULL, 0,
+    /* Legacy non-connectable PDU (ADV_NONCONN_IND): proximity-pair popups read
+     * the raw payload and legacy scanners see it. Own ext-adv instance, so it no
+     * longer fights HID/NUS for a single slot. */
+    ble_extadv_start(BLE_ADV_INST_SPAM, false, true, rnd, adv, len,
                      spam_gap_event, NULL);
 }
 

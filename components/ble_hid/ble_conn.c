@@ -236,14 +236,14 @@ ble_adv_begin(void)
     fields.name_len = strlen(s_adv_name);
     fields.name_is_complete = 1;
 
-    uint8_t buf[BLE_HS_ADV_MAX_SZ]; uint8_t blen = 0;
+    uint8_t buf[128]; uint8_t blen = 0;
     rc = ble_hs_adv_set_fields(&fields, buf, &blen, sizeof buf);
     if (rc != 0) { ESP_LOGE(TAG, "generic adv fields rc=%d", rc); return; }
 
     /* Generic adv's OWN static-random address (salt 0x02), distinct from HID/NUS. */
     uint8_t addr[6];
     ble_static_rnd_addr(addr, 0x02);
-    rc = ble_extadv_start(BLE_ADV_INST_GEN, true, addr, buf, blen, NULL, 0,
+    rc = ble_extadv_start(BLE_ADV_INST_GEN, true, false, addr, buf, blen,
                           ble_conn_gap_event, NULL);
     if (rc == 0) ESP_LOGI(TAG, "generic advertising as \"%s\"", s_adv_name);
 }

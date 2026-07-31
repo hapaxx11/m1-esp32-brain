@@ -196,27 +196,19 @@ ble_nus_adv_start(void)
         return ESP_OK;
     }
 
-    /* The 128-bit NUS UUID (18 bytes) + flags nearly fill the 31-byte adv packet,
-     * so the name goes in the SCAN RESPONSE. No tx-power field either. */
+    /* Extended PDU has room for the 128-bit NUS UUID + flags + name in one AD. */
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof fields);
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.uuids128 = (ble_uuid128_t *)&nus_svc_uuid;
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
-    uint8_t adv[BLE_HS_ADV_MAX_SZ]; uint8_t adv_len = 0;
+    fields.name = (uint8_t *)s_name;
+    fields.name_len = strlen(s_name);
+    fields.name_is_complete = 1;
+    uint8_t adv[128]; uint8_t adv_len = 0;
     int rc = ble_hs_adv_set_fields(&fields, adv, &adv_len, sizeof adv);
     if (rc != 0) { ESP_LOGE(TAG, "nus adv fields rc=%d", rc); return ESP_FAIL; }
-
-    /* Device name M1-XXXX in the scan response. */
-    struct ble_hs_adv_fields rsp;
-    memset(&rsp, 0, sizeof rsp);
-    rsp.name = (uint8_t *)s_name;
-    rsp.name_len = strlen(s_name);
-    rsp.name_is_complete = 1;
-    uint8_t rbuf[BLE_HS_ADV_MAX_SZ]; uint8_t rlen = 0;
-    rc = ble_hs_adv_set_fields(&rsp, rbuf, &rlen, sizeof rbuf);
-    if (rc != 0) ESP_LOGW(TAG, "nus rsp fields rc=%d (name only)", rc);
 
     /* Assert OUR name into the GAP Device Name (0x2A00). The GATT server is shared
      * across ext-adv sets, so a central reading 0x2A00 sees the last advertiser's
@@ -226,8 +218,8 @@ ble_nus_adv_start(void)
     /* Direct's OWN static-random address (salt 0x00), distinct from Bad-BT's. */
     uint8_t addr[6];
     ble_static_rnd_addr(addr, 0x00);
-    rc = ble_extadv_start(BLE_ADV_INST_NUS, true, addr, adv, adv_len,
-                          (rlen ? rbuf : NULL), rlen, nus_gap_event, NULL);
+    rc = ble_extadv_start(BLE_ADV_INST_NUS, true, false, addr, adv, adv_len,
+                          nus_gap_event, NULL);
     if (rc != 0) { ESP_LOGE(TAG, "nus ext_adv rc=%d", rc); return ESP_FAIL; }
     s_advertising = true;
     ESP_LOGI(TAG, "advertising as \"%s\"", s_name);
