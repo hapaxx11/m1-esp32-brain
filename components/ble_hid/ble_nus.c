@@ -13,6 +13,7 @@
 #include "esp_mac.h"
 #include "nimble/ble.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_adv.h"   /* ble_hs_adv_set_fields, BLE_HS_ADV_MAX_SZ */
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "services/gap/ble_svc_gap.h"
@@ -38,7 +39,6 @@ static uint16_t s_tx_handle = 0;       /* TX characteristic value handle */
 static uint16_t s_mtu       = 23;      /* negotiated ATT MTU (BLE default until updated) */
 static bool     s_tx_subscribed = false;
 static bool     s_advertising   = false;
-static uint8_t  s_own_addr_type = 0;
 static char     s_name[32]      = "M1-BLE";
 static bool     s_name_set      = false;   /* true once the host sets a name */
 
@@ -190,31 +190,23 @@ ble_nus_adv_start(void)
         return ESP_OK;
     }
 
-    /* The host may not be synced yet on the very first call; infer_auto fails
-     * until sync, in which case we mark intent and (re)start on the sync path
-     * via the GAP restart. Try now; NimBLE returns an error we can log. */
-    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "infer_auto not ready (rc=%d) — will advertise once synced", rc);
-        s_advertising = true;   /* intent latched; see note below */
+    /* Host not synced yet? Latch intent; ble_nus_on_host_synced() re-starts. */
+    if (ble_host_own_addr_type() < 0) {
+        s_advertising = true;
         return ESP_OK;
     }
 
     /* The 128-bit NUS UUID (18 bytes) + flags nearly fill the 31-byte adv packet,
-     * so the name goes in the SCAN RESPONSE — otherwise ble_gap_adv_set_fields
-     * fails with EMSGSIZE and nothing ever advertises. No tx-power field either. */
+     * so the name goes in the SCAN RESPONSE. No tx-power field either. */
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof fields);
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.uuids128 = (ble_uuid128_t *)&nus_svc_uuid;
     fields.num_uuids128 = 1;
     fields.uuids128_is_complete = 1;
-
-    rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_set_fields failed; rc=%d", rc);
-        return ESP_FAIL;
-    }
+    uint8_t adv[BLE_HS_ADV_MAX_SZ]; uint8_t adv_len = 0;
+    int rc = ble_hs_adv_set_fields(&fields, adv, &adv_len, sizeof adv);
+    if (rc != 0) { ESP_LOGE(TAG, "nus adv fields rc=%d", rc); return ESP_FAIL; }
 
     /* Device name M1-XXXX in the scan response. */
     struct ble_hs_adv_fields rsp;
@@ -222,27 +214,21 @@ ble_nus_adv_start(void)
     rsp.name = (uint8_t *)s_name;
     rsp.name_len = strlen(s_name);
     rsp.name_is_complete = 1;
-    rc = ble_gap_adv_rsp_set_fields(&rsp);
-    if (rc != 0)
-        ESP_LOGW(TAG, "adv_rsp_set_fields failed; rc=%d (name only)", rc);
+    uint8_t rbuf[BLE_HS_ADV_MAX_SZ]; uint8_t rlen = 0;
+    rc = ble_hs_adv_set_fields(&rsp, rbuf, &rlen, sizeof rbuf);
+    if (rc != 0) ESP_LOGW(TAG, "nus rsp fields rc=%d (name only)", rc);
 
-    /* Assert OUR name into the global GAP Device Name (0x2A00). NimBLE has one
-     * such characteristic for the whole host; Bad-BT/HID also writes it. Setting
-     * it here means a central that reads 0x2A00 after connecting to Direct sees
-     * the Direct name, not a leftover Bad-BT name — the decoupling fix. */
+    /* Assert OUR name into the GAP Device Name (0x2A00). The GATT server is shared
+     * across ext-adv sets, so a central reading 0x2A00 sees the last advertiser's
+     * name; keep it the Direct name while Direct advertises. */
     ble_svc_gap_device_name_set(s_name);
 
-    struct ble_gap_adv_params adv_params;
-    memset(&adv_params, 0, sizeof adv_params);
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
-                           &adv_params, nus_gap_event, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_start failed; rc=%d", rc);
-        return ESP_FAIL;
-    }
+    /* Direct's OWN static-random address (salt 0x00), distinct from Bad-BT's. */
+    uint8_t addr[6];
+    ble_static_rnd_addr(addr, 0x00);
+    rc = ble_extadv_start(BLE_ADV_INST_NUS, true, addr, adv, adv_len,
+                          (rlen ? rbuf : NULL), rlen, nus_gap_event, NULL);
+    if (rc != 0) { ESP_LOGE(TAG, "nus ext_adv rc=%d", rc); return ESP_FAIL; }
     s_advertising = true;
     ESP_LOGI(TAG, "advertising as \"%s\"", s_name);
     return ESP_OK;
@@ -252,7 +238,7 @@ void
 ble_nus_adv_stop(void)
 {
     s_advertising = false;
-    ble_gap_adv_stop();
+    ble_extadv_stop(BLE_ADV_INST_NUS);
     ESP_LOGI(TAG, "advertising stopped");
 }
 

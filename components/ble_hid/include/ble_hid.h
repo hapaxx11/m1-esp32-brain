@@ -19,10 +19,38 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "host/ble_gap.h"   /* ble_gap_event_fn — shared ext-adv helper below */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Extended-advertising instance ids. With ext-adv each set has its OWN
+ * static-random address, so Bad-BT (HID) and Bluetooth Direct (NUS) are
+ * genuinely separate BLE identities (the C6 exposes no public address, so
+ * legacy advertising was forced to share one). */
+#define BLE_ADV_INST_HID   0
+#define BLE_ADV_INST_NUS   1
+#define BLE_ADV_INST_SPAM  2
+#define BLE_ADV_INST_GEN   3
+
+/* Derive a stable static-random address from the BT MAC (top two bits of the
+ * MSByte forced to 0b11). `salt` is XORed into the low byte to make each role's
+ * address distinct (HID/NUS/generic each pass a different salt). */
+void ble_static_rnd_addr(uint8_t out[6], uint8_t salt);
+
+/* Start a legacy-PDU extended advertisement on `instance` with static-random
+ * `rnd_addr`. `connectable` selects ADV_IND vs ADV_NONCONN_IND. `rsp`/`rsp_len`
+ * add a scan response (pass NULL/0 to skip). Reconfigures the instance each call
+ * so name/address changes take effect. Returns 0 on success. */
+int  ble_extadv_start(uint8_t instance, bool connectable,
+                      const uint8_t rnd_addr[6],
+                      const uint8_t *adv, uint8_t adv_len,
+                      const uint8_t *rsp, uint8_t rsp_len,
+                      ble_gap_event_fn *cb, void *cb_arg);
+
+/* Stop the extended advertisement on `instance` (harmless if not advertising). */
+void ble_extadv_stop(uint8_t instance);
 
 /**
  * Bring up the shared NimBLE host exactly once (NVS, nimble_port_init,

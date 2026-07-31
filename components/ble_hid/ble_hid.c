@@ -19,6 +19,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_adv.h"   /* ble_hs_adv_set_fields, BLE_HS_ADV_MAX_SZ */
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_uuid.h"
@@ -129,8 +130,7 @@ static uint8_t  s_own_addr_type;
  * bond tied to a different BLE identity, so the PC no longer auto-reconnects to
  * (and camps) the Direct connection at boot. MAC-derived => stable across
  * reboots so the bonded keyboard host still reconnects. */
-static uint8_t  s_hid_rnd_addr[6];
-static bool     s_hid_addr_ready = false;
+static uint8_t  s_hid_rnd_addr[6];   /* Bad-BT's static-random ext-adv address */
 static char     s_device_name[HID_MAX_ADV_NAME_LEN + 1] = "ESP32-C6 KB";
 
 /* A HID stop is asynchronous at the GAP layer.  Keep a private completion
@@ -453,10 +453,80 @@ ble_hid_gap_event(struct ble_gap_event *event, void *arg)
  * Advertising
  * ======================================================================== */
 
+/* ---- Shared extended-advertising helpers (used by HID/NUS/spam/generic) ---- */
+
+void
+ble_static_rnd_addr(uint8_t out[6], uint8_t salt)
+{
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    memcpy(out, mac, 6);
+    out[5] |= 0xC0;      /* static-random: MSByte bits 7:6 = 11 */
+    out[0] ^= salt;      /* per-role distinct low byte */
+}
+
+int
+ble_extadv_start(uint8_t instance, bool connectable,
+                 const uint8_t rnd_addr[6],
+                 const uint8_t *adv, uint8_t adv_len,
+                 const uint8_t *rsp, uint8_t rsp_len,
+                 ble_gap_event_fn *cb, void *cb_arg)
+{
+    struct ble_gap_ext_adv_params params;
+    memset(&params, 0, sizeof params);
+    params.connectable   = connectable ? 1 : 0;
+    params.scannable     = (rsp && rsp_len) ? 1 : 0;
+    params.legacy_pdu    = 1;                    /* legacy PDUs => any BLE central connects */
+    params.own_addr_type = BLE_OWN_ADDR_RANDOM;
+    params.primary_phy   = BLE_HCI_LE_PHY_1M;
+    params.secondary_phy = BLE_HCI_LE_PHY_1M;
+    params.itvl_min      = 0x30;                 /* 30 ms (0.625 ms units) */
+    params.itvl_max      = 0x60;                 /* 60 ms */
+    params.sid           = instance;
+    params.tx_power      = 127;
+
+    /* Must be stopped to (re)configure; ignore "already configured". */
+    ble_gap_ext_adv_stop(instance);
+    int rc = ble_gap_ext_adv_configure(instance, &params, NULL, cb, cb_arg);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGE(TAG, "ext_adv_configure inst%u rc=%d", instance, rc);
+        return rc;
+    }
+
+    ble_addr_t addr;
+    addr.type = BLE_ADDR_RANDOM;
+    memcpy(addr.val, rnd_addr, 6);
+    rc = ble_gap_ext_adv_set_addr(instance, &addr);
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_addr inst%u rc=%d", instance, rc); return rc; }
+
+    struct os_mbuf *d = os_msys_get_pkthdr(adv_len, 0);
+    if (d == NULL) return BLE_HS_ENOMEM;
+    if ((rc = os_mbuf_append(d, adv, adv_len)) != 0) { os_mbuf_free_chain(d); return rc; }
+    rc = ble_gap_ext_adv_set_data(instance, d);   /* consumes the mbuf */
+    if (rc != 0) { ESP_LOGE(TAG, "ext_adv_set_data inst%u rc=%d", instance, rc); return rc; }
+
+    if (rsp && rsp_len) {
+        struct os_mbuf *r = os_msys_get_pkthdr(rsp_len, 0);
+        if (r == NULL) return BLE_HS_ENOMEM;
+        if ((rc = os_mbuf_append(r, rsp, rsp_len)) != 0) { os_mbuf_free_chain(r); return rc; }
+        rc = ble_gap_ext_adv_rsp_set_data(instance, r);
+        if (rc != 0) { ESP_LOGE(TAG, "ext_adv_rsp inst%u rc=%d", instance, rc); return rc; }
+    }
+
+    rc = ble_gap_ext_adv_start(instance, 0, 0);   /* forever, unlimited events */
+    if (rc != 0) ESP_LOGE(TAG, "ext_adv_start inst%u rc=%d", instance, rc);
+    return rc;
+}
+
+void
+ble_extadv_stop(uint8_t instance)
+{
+    ble_gap_ext_adv_stop(instance);
+}
+
 static int
 ble_hid_advertise(void)
 {
-    struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
     int rc;
 
@@ -469,61 +539,37 @@ ble_hid_advertise(void)
     ble_svc_gap_device_name_set(s_device_name);
 
     memset(&fields, 0, sizeof fields);
-
-    /* General discoverable + BLE-only (BR/EDR unsupported). */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-
     /* Appearance = HID Keyboard so hosts show a keyboard icon and HOGP binds. */
     fields.appearance = HID_APPEARANCE_KEYBOARD;
     fields.appearance_is_present = 1;
-
     /* Advertise the HID service UUID (0x1812). */
-    fields.uuids16 = (ble_uuid16_t[]) {
-        BLE_UUID16_INIT(HID_SVC_UUID)
-    };
+    fields.uuids16 = (ble_uuid16_t[]) { BLE_UUID16_INIT(HID_SVC_UUID) };
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
 
-    rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_set_fields failed; rc=%d", rc);
-        return rc;
-    }
+    uint8_t adv[BLE_HS_ADV_MAX_SZ]; uint8_t adv_len = 0;
+    rc = ble_hs_adv_set_fields(&fields, adv, &adv_len, sizeof adv);
+    if (rc != 0) { ESP_LOGE(TAG, "hid adv fields rc=%d", rc); return rc; }
 
-    /* The primary advertisement already carries flags, TX power, appearance,
-     * and the HID UUID. Putting a user-editable name there limits it to about
-     * 15 characters; longer names made advertising fail silently. Keep the
-     * name in the scan response, where all 29 supported characters fit. */
+    /* Name goes in the scan response (all 29 chars fit; the primary is full). */
     struct ble_hs_adv_fields rsp_fields;
     memset(&rsp_fields, 0, sizeof rsp_fields);
     rsp_fields.name = (uint8_t *)s_device_name;
     rsp_fields.name_len = strlen(s_device_name);
     rsp_fields.name_is_complete = 1;
-    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_rsp_set_fields failed; rc=%d", rc);
-        return rc;
-    }
+    uint8_t rbuf[BLE_HS_ADV_MAX_SZ]; uint8_t rlen = 0;
+    rc = ble_hs_adv_set_fields(&rsp_fields, rbuf, &rlen, sizeof rbuf);
+    if (rc != 0) { ESP_LOGE(TAG, "hid rsp fields rc=%d", rc); return rc; }
 
-    memset(&adv_params, 0, sizeof adv_params);
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-
-    /* Advertise + bond on the HID static-random address (Bad-BT's own identity),
-     * so the PC's keyboard bond does not apply to the Direct/public address.
-     * Fall back to the public address if the random one couldn't be set. */
-    uint8_t own_addr = s_hid_addr_ready ? BLE_OWN_ADDR_RANDOM : s_own_addr_type;
-    rc = ble_gap_adv_start(own_addr, NULL, BLE_HS_FOREVER,
-                           &adv_params, ble_hid_gap_event, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_start failed; rc=%d", rc);
-        return rc;
-    }
-    ESP_LOGI(TAG, "advertising as \"%s\"", s_device_name);
-    return 0;
+    /* Advertise + bond on Bad-BT's OWN static-random address (ext-adv instance),
+     * separate from Direct's, so the PC's keyboard bond never matches Direct. */
+    rc = ble_extadv_start(BLE_ADV_INST_HID, true, s_hid_rnd_addr,
+                          adv, adv_len, rbuf, rlen, ble_hid_gap_event, NULL);
+    if (rc == 0) ESP_LOGI(TAG, "advertising as \"%s\"", s_device_name);
+    return rc;
 }
 
 /* ========================================================================
@@ -562,22 +608,11 @@ ble_host_on_sync(void)
              addr_val[5], addr_val[4], addr_val[3],
              addr_val[2], addr_val[1], addr_val[0]);
 
-    /* Register the HID static-random address (Bad-BT's own identity). Derived
-     * from the BT MAC with the top two bits of the MSByte forced to 0b11 (the
-     * static-random requirement) and one LSB flipped so it can never equal the
-     * public address. Set once; NUS/Direct keeps using the public address. */
-    if (!s_hid_addr_ready) {
-        uint8_t mac[6] = {0};
-        if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK) {
-            memcpy(s_hid_rnd_addr, mac, 6);
-            s_hid_rnd_addr[5] |= 0xC0;   /* static-random: MSByte bits 7:6 = 11 */
-            s_hid_rnd_addr[0] ^= 0x01;   /* guarantee it differs from the public MAC */
-            if (ble_hs_id_set_rnd(s_hid_rnd_addr) == 0)
-                s_hid_addr_ready = true;
-            else
-                ESP_LOGW(TAG, "ble_hs_id_set_rnd failed; HID will use public addr");
-        }
-    }
+    /* Compute Bad-BT's OWN static-random address (salt 0x01). With extended
+     * advertising each set carries its own address via ble_gap_ext_adv_set_addr,
+     * so we do NOT call the host-wide ble_hs_id_set_rnd (that single random slot
+     * is what forced HID and NUS onto the same address before). */
+    ble_static_rnd_addr(s_hid_rnd_addr, 0x01);
 
     s_synced = true;
 
@@ -753,7 +788,7 @@ ble_hid_start(const char *device_name)
      * sync callback has already run without advertising — start advertising
      * now. Otherwise ble_host_on_sync() will advertise once sync completes. */
     if (s_synced && !s_connected) {
-        ble_gap_adv_stop();
+        ble_extadv_stop(BLE_ADV_INST_HID);
         if (ble_hid_advertise() != 0)
             return ESP_FAIL;
     }
@@ -780,9 +815,8 @@ ble_hid_stop_and_wait(uint32_t timeout_ms)
     /* Disable intent before stopping GAP so neither ADV_COMPLETE nor the
      * disconnect callback can revive this advertiser. */
     s_hid_enabled = false;
-    int rc = ble_gap_adv_stop();
-    if (rc != 0 && rc != BLE_HS_EALREADY)
-        ESP_LOGW(TAG, "adv_stop during HID teardown; rc=%d", rc);
+    ble_extadv_stop(BLE_ADV_INST_HID);
+    int rc = 0;
 
     if (!s_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         s_connected = false;

@@ -151,19 +151,11 @@ static void spam_once(uint8_t mode)
     for (int i = 0; i < 6; i++) rnd[i] = (uint8_t)esp_random();
     rnd[5] |= 0xC0;
 
-    ble_gap_adv_stop();                 /* harmless if not advertising */
-    ble_hs_id_set_rnd(rnd);
-    if (ble_gap_adv_set_data(adv, len) != 0)
-        return;                         /* host not ready yet; retry next cycle */
-
-    struct ble_gap_adv_params p;
-    memset(&p, 0, sizeof p);
-    p.conn_mode = BLE_GAP_CONN_MODE_UND;   /* connectable undirected (ADV_IND) */
-    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    p.itvl_min  = 0x20;                    /* 20 ms */
-    p.itvl_max  = 0x30;                    /* 30 ms */
-    ble_gap_adv_start(BLE_OWN_ADDR_RANDOM, NULL, BLE_HS_FOREVER,
-                      &p, spam_gap_event, NULL);
+    /* Connectable (ADV_IND) so proximity-pair popups trigger; spam_gap_event
+     * drops any central that connects. Raw payload, no scan response. Runs on its
+     * own ext-adv instance so it no longer fights HID/NUS for a single slot. */
+    ble_extadv_start(BLE_ADV_INST_SPAM, true, rnd, adv, len, NULL, 0,
+                     spam_gap_event, NULL);
 }
 
 static void spam_task(void *arg)
@@ -175,7 +167,7 @@ static void spam_task(void *arg)
         spam_once(m);
         vTaskDelay(pdMS_TO_TICKS(SPAM_BURST_MS));
     }
-    ble_gap_adv_stop();
+    ble_extadv_stop(BLE_ADV_INST_SPAM);
     s_task = NULL;
     vTaskDelete(NULL);
 }
@@ -187,8 +179,8 @@ esp_err_t ble_spam_start(uint8_t mode)
     esp_err_t err = ble_host_ensure_started();
     if (err != ESP_OK) return err;
 
-    /* Single legacy adv instance — stop HID/generic adv before taking it over. */
-    ble_gap_adv_stop();
+    /* Own ext-adv instance now, so no need to stop HID/NUS first. */
+    ble_extadv_stop(BLE_ADV_INST_SPAM);
 
     s_mode    = (mode > BLE_SPAM_MODE_ALL) ? BLE_SPAM_MODE_ALL : mode;
     s_running = true;
@@ -207,7 +199,7 @@ void ble_spam_stop(void)
     /* Wait for the worker to stop advertising and self-delete (~up to 600ms). */
     for (int i = 0; i < 120 && s_task != NULL; i++)
         vTaskDelay(pdMS_TO_TICKS(5));
-    ble_gap_adv_stop();
+    ble_extadv_stop(BLE_ADV_INST_SPAM);
     ESP_LOGI(TAG, "spam stop");
 }
 

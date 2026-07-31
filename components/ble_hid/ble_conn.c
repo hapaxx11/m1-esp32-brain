@@ -218,48 +218,34 @@ ble_conn_is_connected(void)
 static void
 ble_adv_begin(void)
 {
-    struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields  fields;
     int rc;
 
-    int at = ble_host_own_addr_type();
-    if (at < 0) {
+    if (ble_host_own_addr_type() < 0) {
         ESP_LOGE(TAG, "host not synced; cannot advertise yet");
         return;
     }
 
     memset(&fields, 0, sizeof fields);
-
-    /* General discoverable + BLE-only (BR/EDR unsupported). */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-
     fields.appearance = GENERIC_APPEARANCE;
     fields.appearance_is_present = 1;
-
     fields.name = (uint8_t *)s_adv_name;
     fields.name_len = strlen(s_adv_name);
     fields.name_is_complete = 1;
 
-    rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_set_fields failed; rc=%d", rc);
-        return;
-    }
+    uint8_t buf[BLE_HS_ADV_MAX_SZ]; uint8_t blen = 0;
+    rc = ble_hs_adv_set_fields(&fields, buf, &blen, sizeof buf);
+    if (rc != 0) { ESP_LOGE(TAG, "generic adv fields rc=%d", rc); return; }
 
-    memset(&adv_params, 0, sizeof adv_params);
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;   /* undirected connectable */
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;   /* general discoverable */
-
-    rc = ble_gap_adv_start((uint8_t)at, NULL, BLE_HS_FOREVER,
-                           &adv_params, ble_conn_gap_event, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "adv_start failed; rc=%d", rc);
-        return;
-    }
-    ESP_LOGI(TAG, "generic advertising as \"%s\"", s_adv_name);
+    /* Generic adv's OWN static-random address (salt 0x02), distinct from HID/NUS. */
+    uint8_t addr[6];
+    ble_static_rnd_addr(addr, 0x02);
+    rc = ble_extadv_start(BLE_ADV_INST_GEN, true, addr, buf, blen, NULL, 0,
+                          ble_conn_gap_event, NULL);
+    if (rc == 0) ESP_LOGI(TAG, "generic advertising as \"%s\"", s_adv_name);
 }
 
 esp_err_t
@@ -280,9 +266,8 @@ ble_adv_start(const char *name)
 
     s_adv_active = true;
 
-    /* Legacy advertising is a single instance: stop whatever is advertising
-     * (e.g. HID) before starting ours. Harmless if nothing is advertising. */
-    ble_gap_adv_stop();
+    /* Own ext-adv instance now — no need to stop other advertisers. */
+    ble_extadv_stop(BLE_ADV_INST_GEN);
 
     /* If the host hasn't synced yet, ble_adv_begin() will log and no-op; the
      * caller is expected to start advertising after the host is up (as HID and
@@ -299,7 +284,5 @@ void
 ble_adv_stop(void)
 {
     s_adv_active = false;
-    int rc = ble_gap_adv_stop();
-    if (rc != 0 && rc != BLE_HS_EALREADY)
-        ESP_LOGW(TAG, "ble_gap_adv_stop; rc=%d", rc);
+    ble_extadv_stop(BLE_ADV_INST_GEN);
 }
