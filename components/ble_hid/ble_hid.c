@@ -681,7 +681,15 @@ ble_host_ensure_started(void)
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
     ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    /* Distribute the encryption key but NOT our identity (IRK + identity addr).
+     * NimBLE hands out the PUBLIC address as the identity even when Bad-BT
+     * advertises on its static-random address, so distributing it made Windows
+     * bond the M1 to its public identity and reconnect to Direct (public) at
+     * boot — camping the Direct link. Without the ID key the bond keys to the
+     * static-random address Bad-BT actually connected on, so the PC only ever
+     * reconnects to Bad-BT, never to Direct. HID over a stable static-random
+     * address reconnects fine without the identity key (no RPA to resolve). */
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
     err = ble_hid_gatt_register();
