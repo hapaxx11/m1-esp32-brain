@@ -40,6 +40,7 @@ static bool     s_tx_subscribed = false;
 static bool     s_advertising   = false;
 static uint8_t  s_own_addr_type = 0;
 static char     s_name[32]      = "M1-BLE";
+static bool     s_name_set      = false;   /* true once the host sets a name */
 
 static int nus_gap_event(struct ble_gap_event *event, void *arg);
 
@@ -105,10 +106,16 @@ ble_nus_gatt_register(void)
      * other way — rpc_server just holds a function pointer). */
     rpc_server_set_ble_tx(ble_nus_send);
 
-    /* Device name M1-XXXX from the low 2 bytes of the BT MAC. */
-    uint8_t mac[6] = {0};
-    if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK)
-        snprintf(s_name, sizeof(s_name), "M1-%02X%02X", mac[4], mac[5]);
+    /* Device name M1-XXXX from the low 2 bytes of the BT MAC — but ONLY as the
+     * fallback default. The host brings the BLE stack up lazily on the first BLE
+     * op, so at boot ble_nus_set_name() (from the enable RPC) can run BEFORE this
+     * function; do NOT overwrite a host-provided name, or the boot-time Direct
+     * name silently reverts to the MAC default. */
+    if (!s_name_set) {
+        uint8_t mac[6] = {0};
+        if (esp_read_mac(mac, ESP_MAC_BT) == ESP_OK)
+            snprintf(s_name, sizeof(s_name), "M1-%02X%02X", mac[4], mac[5]);
+    }
 
     return ESP_OK;
 }
@@ -135,6 +142,7 @@ ble_nus_set_name(const char *name)
     if (name == NULL || name[0] == '\0')
         return;
     strlcpy(s_name, name, sizeof(s_name));
+    s_name_set = true;   /* host name wins; gatt_register must not clobber it */
 }
 
 bool
