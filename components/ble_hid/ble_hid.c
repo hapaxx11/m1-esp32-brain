@@ -131,6 +131,7 @@ static uint8_t  s_own_addr_type;
  * (and camps) the Direct connection at boot. MAC-derived => stable across
  * reboots so the bonded keyboard host still reconnects. */
 static uint8_t  s_hid_rnd_addr[6];   /* Bad-BT's static-random ext-adv address */
+static int      s_last_hid_adv_rc = 0;   /* last ble_extadv_start rc for HID (diag) */
 static char     s_device_name[HID_MAX_ADV_NAME_LEN + 1] = "ESP32-C6 KB";
 
 /* A HID stop is asynchronous at the GAP layer.  Keep a private completion
@@ -529,18 +530,15 @@ ble_hid_advertise(void)
      * one global characteristic and get read back as the keyboard's name. */
     ble_svc_gap_device_name_set(s_device_name);
 
+    /* Match the exact minimal field set that Direct (NUS) advertises successfully
+     * over ext-adv: flags + service UUID + name. The tx-power and appearance AD
+     * fields (which Direct does NOT carry) are the only thing that differed, and
+     * HID was the only set that failed to start — so drop them. */
     memset(&fields, 0, sizeof fields);
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    /* Appearance = HID Keyboard so hosts show a keyboard icon and HOGP binds. */
-    fields.appearance = HID_APPEARANCE_KEYBOARD;
-    fields.appearance_is_present = 1;
-    /* Advertise the HID service UUID (0x1812). */
     fields.uuids16 = (ble_uuid16_t[]) { BLE_UUID16_INIT(HID_SVC_UUID) };
     fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
-    /* Name lives in the primary AD (extended PDU has room; no scan response). */
     fields.name = (uint8_t *)s_device_name;
     fields.name_len = strlen(s_device_name);
     fields.name_is_complete = 1;
@@ -553,7 +551,9 @@ ble_hid_advertise(void)
      * Direct's, so the PC's keyboard bond never matches Direct. */
     rc = ble_extadv_start(BLE_ADV_INST_HID, true, false, s_hid_rnd_addr,
                           adv, adv_len, ble_hid_gap_event, NULL);
+    s_last_hid_adv_rc = rc;   /* retained for diagnostics if it fails again */
     if (rc == 0) ESP_LOGI(TAG, "advertising as \"%s\"", s_device_name);
+    else         ESP_LOGE(TAG, "HID ext-adv start failed; rc=%d", rc);
     return rc;
 }
 
@@ -858,6 +858,12 @@ ble_hid_is_advertising(void)
 {
     /* Bad-BT is advertising when it is enabled, synced, and not yet connected. */
     return s_hid_enabled && s_synced && !s_connected;
+}
+
+int
+ble_hid_last_adv_rc(void)
+{
+    return s_last_hid_adv_rc;
 }
 
 esp_err_t

@@ -118,6 +118,9 @@ bool ble_hid_is_ready(void);
 /** @return true while Bad-BT is advertising (enabled, synced, not yet connected). */
 bool ble_hid_is_advertising(void);
 
+/** @return the last ble_gap_ext_adv_start() rc for the HID set (0 = ok). Diag. */
+int ble_hid_last_adv_rc(void);
+
 /**
  * Send a single 8-byte HID keyboard report [modifier, 0x00, k0..k5] as a
  * notification on the Report Input characteristic. The caller is responsible

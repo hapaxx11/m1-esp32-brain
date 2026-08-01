@@ -156,7 +156,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 3; v.patch = 2;
+    v.major = 1; v.minor = 3; v.patch = 3;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -795,11 +795,13 @@ static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
  * One byte of flags — Direct (NUS) and Bad-BT (HID) are independent identities. */
 static void handle_ble_state(const m1_rpc_header_t *hdr)
 {
-    uint8_t flags = (ble_nus_is_advertising() ? 0x01 : 0x00) |
-                    (ble_nus_connected()      ? 0x02 : 0x00) |
-                    (ble_hid_is_advertising() ? 0x04 : 0x00) |
-                    (ble_hid_is_connected()   ? 0x08 : 0x00);
-    send_resp(hdr->msg_id, &flags, 1);
+    uint8_t resp[2];
+    resp[0] = (ble_nus_is_advertising() ? 0x01 : 0x00) |
+              (ble_nus_connected()      ? 0x02 : 0x00) |
+              (ble_hid_is_advertising() ? 0x04 : 0x00) |
+              (ble_hid_is_connected()   ? 0x08 : 0x00);
+    resp[1] = (uint8_t)(int8_t)ble_hid_last_adv_rc();   /* diag: last HID ext-adv rc */
+    send_resp(hdr->msg_id, resp, sizeof(resp));
 }
 
 /* ---------- SoftAP ("WiFi Hotspot") ---------- */
