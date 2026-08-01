@@ -29,10 +29,14 @@ extern "C" {
  * static-random address, so Bad-BT (HID) and Bluetooth Direct (NUS) are
  * genuinely separate BLE identities (the C6 exposes no public address, so
  * legacy advertising was forced to share one). */
-#define BLE_ADV_INST_HID   0
-#define BLE_ADV_INST_NUS   1
-#define BLE_ADV_INST_SPAM  2
-#define BLE_ADV_INST_GEN   3
+/* Instance 0 is kept for the NON-connectable set (spam): esp-idf's ble_multi_adv
+ * example puts connectable advertising on a non-zero instance and non-connectable
+ * on instance 0, and connectable on instance 0 fails to start on the C6 (Direct on
+ * instance 1 works, HID on instance 0 did not). Keep every connectable set >0. */
+#define BLE_ADV_INST_SPAM  0   /* non-connectable */
+#define BLE_ADV_INST_NUS   1   /* connectable (confirmed working) */
+#define BLE_ADV_INST_HID   2   /* connectable */
+#define BLE_ADV_INST_GEN   3   /* connectable */
 
 /* Derive a stable static-random address from the BT MAC (top two bits of the
  * MSByte forced to 0b11). `salt` is XORed into the low byte to make each role's

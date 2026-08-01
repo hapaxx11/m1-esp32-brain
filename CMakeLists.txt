@@ -8,6 +8,6 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # Release version, exposed via esp_app_desc.version and reported to qMonstatek
 # in device info (shown as "m1_link <ver>").
-set(PROJECT_VER "1.3.1")
+set(PROJECT_VER "1.3.2")
 
 project(m1-esp32-brain)
