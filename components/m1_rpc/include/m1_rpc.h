@@ -185,6 +185,8 @@ typedef enum {
     M1_RPC_BLE_SPAM_STOP       = 0x040E, /* REQ (none) -> RESP u8 status */
     M1_RPC_BLE_RPC_ADV         = 0x040F, /* REQ u8 enable [+ name bytes when enable=1] -> RESP u8 status — Bluetooth-Direct (NUS). Name is OPTIONAL (len==1 keeps current). */
     M1_RPC_BLE_STATE           = 0x0410, /* REQ (none) -> RESP u8 flags: bit0 direct_adv, bit1 direct_conn, bit2 hid_adv, bit3 hid_conn */
+    M1_RPC_BLE_BEACON_START    = 0x0411, /* REQ [type:1] then iBeacon [uuid:16][major:2 LE][minor:2 LE][tx:i8] OR Eddystone-URL [url bytes] -> RESP u8 status */
+    M1_RPC_BLE_BEACON_STOP     = 0x0412, /* REQ (none) -> RESP u8 status */
 
     /* ---- Zigbee / 802.15.4 0x0500-0x05FF ---- */
     M1_RPC_ZB_INIT             = 0x0500,

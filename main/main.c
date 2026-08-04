@@ -27,6 +27,7 @@
 #include "ble_conn.h"
 #include "ble_spam.h"
 #include "ble_nus.h"
+#include "ble_beacon.h"
 #include "ieee802154_sniff.h"
 #include "esp_now_link.h"
 #include "m1_rpc.h"
@@ -156,7 +157,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 3; v.patch = 3;
+    v.major = 1; v.minor = 5; v.patch = 0;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -759,6 +760,29 @@ static void handle_ble_spam_start(const m1_rpc_header_t *hdr,
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
 
+/* BLE beacon emulator: [type:1] 0=iBeacon 1=Eddystone-URL, then the fields. */
+static void handle_ble_beacon_start(const m1_rpc_header_t *hdr,
+                                    const uint8_t *payload, uint16_t len)
+{
+    if (len < 1) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    esp_err_t err;
+    if (payload[0] == 0) {                 /* iBeacon: [uuid:16][major:2 LE][minor:2 LE][tx:i8] */
+        if (len < 1 + 16 + 2 + 2 + 1) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+        uint16_t major = (uint16_t)(payload[17] | (payload[18] << 8));
+        uint16_t minor = (uint16_t)(payload[19] | (payload[20] << 8));
+        err = ble_beacon_start_ibeacon(&payload[1], major, minor, (int8_t)payload[21]);
+    } else {                               /* Eddystone-URL: [url bytes] */
+        char url[80];
+        uint16_t n = (uint16_t)(len - 1);
+        if (n > sizeof(url) - 1) n = sizeof(url) - 1;
+        memcpy(url, &payload[1], n);
+        url[n] = 0;
+        err = ble_beacon_start_eddystone_url(url);
+    }
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
 /* Bluetooth Direct: start/stop advertising the NUS RPC service (M1 toggle). */
 static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
                                const uint8_t *payload, uint16_t len)
@@ -1055,6 +1079,13 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_BLE_SPAM_STOP:
         ble_spam_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_BLE_BEACON_START:
+        handle_ble_beacon_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_BEACON_STOP:
+        ble_beacon_stop();
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
 

