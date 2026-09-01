@@ -54,7 +54,7 @@ static const char *TAG = "main";
                      M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
                      M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
                      M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
-                     M1_CAP_KARMA     | M1_CAP_SOFTAP)
+                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_ESPNOW)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
@@ -157,7 +157,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 5; v.patch = 0;
+    v.major = 1; v.minor = 5; v.patch = 1;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
