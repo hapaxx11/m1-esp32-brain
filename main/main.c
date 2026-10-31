@@ -30,6 +30,7 @@
 #include "ble_beacon.h"
 #include "ieee802154_sniff.h"
 #include "esp_now_link.h"
+#include "http_stream.h"
 #include "m1_rpc.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -54,7 +55,7 @@ static const char *TAG = "main";
                      M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
                      M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
                      M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
-                     M1_CAP_KARMA     | M1_CAP_SOFTAP)
+                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_HTTP)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
@@ -157,7 +158,7 @@ static void handle_fw_version(const m1_rpc_header_t *hdr)
 {
     const esp_app_desc_t *desc = esp_app_get_description();
     m1_rpc_fw_version_t v = {0};
-    v.major = 1; v.minor = 5; v.patch = 0;
+    v.major = 1; v.minor = 6; v.patch = 0;
     /* Expose PROJECT_VER via the git_hash slot only when it's a distinct build
      * tag — if it equals the semver, leave it blank so the device info shows
      * "m1_link 1.0.0" instead of a redundant "1.0.0 1.0.0". */
@@ -871,6 +872,51 @@ static void handle_softap_sta_list(const m1_rpc_header_t *hdr)
     send_resp(hdr->msg_id, resp, sizeof(resp));
 }
 
+/* ---------- Streaming HTTP client ---------- */
+
+static void handle_http_open(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (!wifi_mgr_is_connected()) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_NOT_RUNNING);
+        return;
+    }
+
+    m1_rpc_http_open_resp_t resp;
+    http_stream_open(payload, len, &resp);
+    send_resp(hdr->msg_id, (const uint8_t *)&resp, sizeof(resp));
+}
+
+static void handle_http_read(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (len != 2) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+
+    uint16_t want = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8u);
+    if (want == 0 || want > 1024u) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+
+    uint8_t body[1024];
+    int n = http_stream_read(body, want);
+    if (n < 0) {
+        send_nak(hdr->msg_id, n == -ESP_ERR_INVALID_ARG
+               ? M1_RPC_ERR_INVALID_ARGS : M1_RPC_ERR_TIMEOUT);
+        return;
+    }
+    send_resp(hdr->msg_id, body, (uint16_t)n);
+}
+
+static void handle_http_close(const m1_rpc_header_t *hdr)
+{
+    http_stream_close();
+    send_resp(hdr->msg_id, NULL, 0);
+}
+
 /* ---------- Screen push (M1 -> ESP -> qMonstatek) ---------- */
 
 static void handle_screen_push(const m1_rpc_header_t *hdr,
@@ -1132,6 +1178,17 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_NOW_RECV_GET:
         handle_now_recv_get(hdr);
+        break;
+
+    /* Streaming HTTP client */
+    case M1_RPC_NET_HTTP_OPEN:
+        handle_http_open(hdr, payload, payload_len);
+        break;
+    case M1_RPC_NET_HTTP_READ:
+        handle_http_read(hdr, payload, payload_len);
+        break;
+    case M1_RPC_NET_HTTP_CLOSE:
+        handle_http_close(hdr);
         break;
 
     /* Screen streaming */
