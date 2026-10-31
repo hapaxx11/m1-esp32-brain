@@ -290,6 +290,7 @@ typedef enum {
 #define M1_CAP_BLE_SPAM      (UINT64_C(1) << 21)
 #define M1_CAP_802154_TX     (UINT64_C(1) << 22)
 #define M1_CAP_SOFTAP        (UINT64_C(1) << 23)
+#define M1_CAP_ESPNOW        (UINT64_C(1) << 24)
 
 #define M1_RPC_FW_NAME_LEN   32
 
