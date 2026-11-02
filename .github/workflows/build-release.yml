@@ -29,7 +29,7 @@ jobs:
         run: |
           . "$IDF_PATH/export.sh"
           idf.py build
-          idf.py merge-bin -o build/factory_ESP32C6-SPI.bin
+          idf.py merge-bin -o factory_ESP32C6-SPI.bin
           cp build/m1-esp32-brain.bin build/app_m1-esp32-brain.bin
 
       - name: Upload firmware artifacts
