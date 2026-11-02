@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
+#include "esp_tls_errors.h"
 #include "lwip/netdb.h"
 
 #define HTTP_STREAM_MAX_REDIRECTS 3
@@ -28,6 +30,16 @@ static m1_rpc_http_result_t http_stream_error_result(esp_http_client_handle_t cl
         return M1_RPC_HTTP_RESULT_NO_MEM;
     if (err == ESP_ERR_HTTP_MAX_REDIRECT)
         return M1_RPC_HTTP_RESULT_REDIRECT;
+
+    int tls_code = 0;
+    int tls_flags = 0;
+    if (client)
+        esp_http_client_get_and_clear_last_tls_error(client, &tls_code, &tls_flags);
+    if (tls_code == ESP_ERR_ESP_TLS_CANNOT_RESOLVE_HOSTNAME)
+        return M1_RPC_HTTP_RESULT_DNS;
+    if (tls_code == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT ||
+        tls_code == ESP_ERR_ESP_TLS_SERVER_HANDSHAKE_TIMEOUT)
+        return M1_RPC_HTTP_RESULT_TIMEOUT;
 
     int socket_err = client ? esp_http_client_get_errno(client) : 0;
     if (socket_err == EAI_AGAIN || socket_err == EAI_FAIL || socket_err == EAI_NONAME)
@@ -88,7 +100,8 @@ void http_stream_open(const uint8_t *payload, uint16_t payload_len,
         .max_redirection_count = HTTP_STREAM_MAX_REDIRECTS,
         .user_agent = "M1-Hapax/1.0",
         .buffer_size = 1024,
-        .buffer_size_tx = 512,
+        .buffer_size_tx = HTTP_STREAM_URL_MAX + 512,
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     s_client = esp_http_client_init(&config);
     free(url);
@@ -127,6 +140,20 @@ void http_stream_open(const uint8_t *payload, uint16_t payload_len,
             err = ESP_ERR_HTTP_MAX_REDIRECT;
             break;
         }
+
+        char redirect_body[128];
+        int read_bytes;
+        do {
+            read_bytes = esp_http_client_read(s_client, redirect_body, sizeof(redirect_body));
+            if (read_bytes < 0) {
+                err = read_bytes == -ESP_ERR_HTTP_EAGAIN ?
+                      ESP_ERR_HTTP_EAGAIN : ESP_ERR_HTTP_FETCH_HEADER;
+                break;
+            }
+        } while (read_bytes > 0);
+        if (err != ESP_OK)
+            break;
+
         err = esp_http_client_set_redirection(s_client);
         if (err != ESP_OK)
             break;
