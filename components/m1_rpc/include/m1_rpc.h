@@ -212,6 +212,11 @@ typedef enum {
     M1_RPC_RPC_STATUS          = 0x0701, /* REQ (none) -> RESP u8 qmonstatek_connected */
     M1_RPC_QMON_POLL           = 0x0702, /* M1 polls ESP for a queued qMonstatek(TCP) frame -> RESP raw frame or empty */
     M1_RPC_QMON_RESP           = 0x0703, /* M1 -> ESP: a qMonstatek response frame to forward to the TCP client */
+
+    /* ---- Streaming HTTP client 0x0800-0x08FF ---- */
+    M1_RPC_NET_HTTP_OPEN       = 0x0800, /* REQ [accept:1][timeout_ms:4 LE][url_len:2 LE][url] */
+    M1_RPC_NET_HTTP_READ       = 0x0801, /* REQ [max_len:2 LE] -> RESP body bytes; empty = EOF */
+    M1_RPC_NET_HTTP_CLOSE      = 0x0802, /* REQ (none) -> RESP (none) */
 } m1_rpc_id_t;
 
 /* ---------- Event IDs 0xE000-0xEFFF (ESP32 -> STM32, msg_type = EVENT) ---------- */
@@ -291,6 +296,7 @@ typedef enum {
 #define M1_CAP_802154_TX     (UINT64_C(1) << 22)
 #define M1_CAP_SOFTAP        (UINT64_C(1) << 23)
 #define M1_CAP_ESPNOW        (UINT64_C(1) << 24)
+#define M1_CAP_HTTP          (UINT64_C(1) << 28)
 
 #define M1_RPC_FW_NAME_LEN   32
 
@@ -325,6 +331,30 @@ typedef struct __attribute__((packed)) {
     uint8_t  second;   /* 0-59 */
     uint8_t  weekday;  /* 0=Sun .. 6=Sat */
 } m1_rpc_time_t;
+
+/* NET_HTTP_OPEN accept selector and result. HTTP status and DNS/connect
+ * failures are separate so the M1 never reports a transport failure as DNS. */
+#define M1_RPC_HTTP_ACCEPT_JSON   0u
+#define M1_RPC_HTTP_ACCEPT_BINARY 1u
+
+typedef enum {
+    M1_RPC_HTTP_RESULT_OK = 0,
+    M1_RPC_HTTP_RESULT_INVALID,
+    M1_RPC_HTTP_RESULT_DNS,
+    M1_RPC_HTTP_RESULT_CONNECT,
+    M1_RPC_HTTP_RESULT_TIMEOUT,
+    M1_RPC_HTTP_RESULT_REDIRECT,
+    M1_RPC_HTTP_RESULT_NO_MEM,
+} m1_rpc_http_result_t;
+
+/* NET_HTTP_OPEN response. content_length is -1 when unknown/chunked. */
+typedef struct __attribute__((packed)) {
+    uint8_t result;
+    uint16_t http_status;
+    int32_t content_length;
+} m1_rpc_http_open_resp_t;
+
+_Static_assert(sizeof(m1_rpc_http_open_resp_t) == 7, "HTTP open response size");
 
 /* One discovered 802.15.4 (Zigbee/Thread) device. ZB_SNIFF_GET response is
  * [u8 count] followed by `count` of these (aggregated + deduped on the ESP). */

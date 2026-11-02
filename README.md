@@ -5,7 +5,9 @@
 Native ESP-IDF co-processor firmware for the [Monstatek M1](https://monstatek.com)'s
 ESP32-C6. It runs the M1's radio features (WiFi, Bluetooth, 802.15.4, ESP-NOW peer
 link) natively and talks to the M1's STM32 over a custom binary SPI link
-(`m1_link`).
+(`m1_link`). Version 1.6.0 also provides streaming HTTPS over
+`NET_HTTP_OPEN/READ/CLOSE` for OTA release listings and firmware downloads,
+advertised through `M1_CAP_HTTP` (bit 28).
 
 This is the ESP32 firmware used by **C3** M1 firmware (v0.8.0.0-C3.107 and later).
 Version 1.5.1 advertises the ESP-NOW peer-link capability bit expected by the
@@ -25,5 +27,5 @@ firmware (which uses a different ESP32 firmware). See the full
 Flash via the qMonstatek desktop app (ESP32 Update) — "Download latest (SPI brain)"
 fetches the current factory image and writes it at `0x0`.
 
-- `factory_m1-esp32-brain.bin` — full image (bootloader + partition table + app), flash at `0x0`
+- `factory_ESP32C6-SPI.bin` (or `factory_m1-esp32-brain.bin` in some builds) — full image (bootloader + partition table + app), flash at `0x0`
 - `app_m1-esp32-brain.bin` — app partition only, flash at `0x60000` (only when the bootloader/partition table are unchanged)
