@@ -1,0 +1,60 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ESP32-C6 firmware
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.3.2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        run: |
+          idf.py build
+          idf.py merge-bin -o build/factory_ESP32C6-SPI.bin
+          cp build/m1-esp32-brain.bin build/app_m1-esp32-brain.bin
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-esp32-brain-firmware
+          path: |
+            build/factory_ESP32C6-SPI.bin
+            build/app_m1-esp32-brain.bin
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: m1-esp32-brain-firmware
+          path: release-assets
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

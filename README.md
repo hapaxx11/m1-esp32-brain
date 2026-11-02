@@ -29,3 +29,10 @@ fetches the current factory image and writes it at `0x0`.
 
 - `factory_ESP32C6-SPI.bin` (or `factory_m1-esp32-brain.bin` in some builds) — full image (bootloader + partition table + app), flash at `0x0`
 - `app_m1-esp32-brain.bin` — app partition only, flash at `0x60000` (only when the bootloader/partition table are unchanged)
+
+## Build and releases
+
+The GitHub Actions workflow builds the ESP32-C6 firmware on pushes to `main`,
+pull requests targeting `main`, and manual runs. Pushing a version tag such as
+`v1.6.0` also publishes a GitHub release containing the factory image and
+application-only image.
