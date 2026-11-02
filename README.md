@@ -10,6 +10,8 @@ link) natively and talks to the M1's STM32 over a custom binary SPI link
 advertised through `M1_CAP_HTTP` (bit 28).
 
 This is the ESP32 firmware used by **C3** M1 firmware (v0.8.0.0-C3.107 and later).
+Version 1.5.1 advertises the ESP-NOW peer-link capability bit expected by the
+Hapax ESP-NOW peer-link compatibility layer.
 
 > **This is a community project and is not affiliated with or endorsed by Monstatek.**
 

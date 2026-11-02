@@ -55,7 +55,7 @@ static const char *TAG = "main";
                      M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
                      M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
                      M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
-                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_HTTP)
+                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_ESPNOW | M1_CAP_HTTP)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
