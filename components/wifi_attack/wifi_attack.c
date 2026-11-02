@@ -13,7 +13,6 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
-#include "dhcpserver/dhcpserver.h"   /* dhcps_set_captiveportal_uri — RFC 8910 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -545,9 +544,6 @@ esp_err_t wifi_attack_captive_start(const wifi_attack_captive_config_t *config)
         uint8_t offer_dns = 2;   /* OFFER_DNS bit — advertise DHCP option 6 */
         esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
                                ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof(offer_dns));
-        /* RFC 8910: advertise the captive-portal API URI (option 114) so modern
-         * OSes auto-open the sign-in page. Must be set before DHCP hands leases. */
-        dhcps_set_captiveportal_uri("http://" CAPTIVE_AP_IP "/api");
         esp_netif_dhcps_start(ap_netif);
     }
 
@@ -601,7 +597,6 @@ esp_err_t wifi_attack_captive_stop(void)
     if (!s_captive_running) return ESP_OK;
     s_captive_running = false;
 
-    dhcps_set_captiveportal_uri(NULL);   /* stop advertising option 114 */
     if (s_captive_httpd) { httpd_stop(s_captive_httpd); s_captive_httpd = NULL; }
     if (s_captive_dns_sock >= 0) {
         int s = s_captive_dns_sock;
