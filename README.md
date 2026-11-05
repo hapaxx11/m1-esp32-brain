@@ -35,4 +35,6 @@ fetches the current factory image and writes it at `0x0`.
 The GitHub Actions workflow builds the ESP32-C6 firmware on pushes to `main`,
 pull requests targeting `main`, and manual runs. Pushing a version tag such as
 `v1.6.0` also publishes a GitHub release containing the factory image and
-application-only image.
+application-only image. To publish manually, run the workflow on the desired
+source branch and enter a `v`-prefixed tag (for example, `v1.6.0`) in the
+`release_tag` field. Leave it empty to build without publishing.
