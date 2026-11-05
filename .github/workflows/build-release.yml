@@ -19,7 +19,7 @@ jobs:
     name: Build ESP32-C6 firmware
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.3.2
+      image: espressif/idf:v5.5
     steps:
       - name: Check out source
         uses: actions/checkout@v4
