@@ -628,8 +628,11 @@ esp_err_t wifi_attack_captive_stop(void)
     s_captive_auth_count     = 0;
     s_captive_upstream_dns   = 0;
 
-    esp_wifi_set_mode(s_captive_prev_mode == WIFI_MODE_NULL ? WIFI_MODE_STA
-                                                            : s_captive_prev_mode);
+    wifi_mode_t restore_mode = s_captive_prev_mode == WIFI_MODE_NULL ? WIFI_MODE_STA
+                                                                    : s_captive_prev_mode;
+    esp_wifi_set_mode(restore_mode);
+    if (ap_netif && (restore_mode == WIFI_MODE_AP || restore_mode == WIFI_MODE_APSTA))
+        esp_netif_dhcps_start(ap_netif);
     ESP_LOGI(TAG, "Captive portal stopped (%d creds captured)", s_captive_cred_count);
     return ESP_OK;
 }
