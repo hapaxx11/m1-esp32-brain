@@ -78,20 +78,24 @@ static void procedure_abort(void)
 {
     s_read_target = NULL;
     s_session++;
+    s_status = -1;
     if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
     } else {
         ble_gap_conn_cancel();
     }
+    if (s_sem) xSemaphoreGive(s_sem);
 }
 
-static bool procedure_wait(uint32_t timeout_ms)
+static int procedure_wait(uint32_t timeout_ms)
 {
-    if (xSemaphoreTake(s_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE && s_status == 0)
-        return true;
+    if (xSemaphoreTake(s_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        if (s_status == 0) return 1;
+        if (s_status > 0) return s_status;
+    }
     procedure_abort();
-    return false;
+    return 0;
 }
 
 static void uuid_store(const ble_uuid_any_t *uuid, gatt_entry_t *entry)
@@ -266,12 +270,12 @@ static bool discover(void)
         procedure_abort();
         return false;
     }
-    if (!procedure_wait(8000) || s_conn == BLE_HS_CONN_HANDLE_NONE)
+    if (procedure_wait(8000) != 1 || s_conn == BLE_HS_CONN_HANDLE_NONE)
         return false;
 
     s_status = 0;
     rc = ble_gattc_disc_all_svcs(s_conn, svc_cb, (void *)(uintptr_t)s_session);
-    if (rc != 0 || !procedure_wait(7000)) {
+    if (rc != 0 || procedure_wait(7000) != 1) {
         if (rc != 0) procedure_abort();
         return false;
     }
@@ -282,7 +286,7 @@ static bool discover(void)
         rc = ble_gattc_disc_all_chrs(s_conn, s_services[i].start_handle,
                                      s_services[i].end_handle, chr_cb,
                                      (void *)(uintptr_t)s_session);
-        if (rc != 0 || !procedure_wait(5000)) {
+        if (rc != 0 || procedure_wait(5000) != 1) {
             if (rc != 0) procedure_abort();
             return false;
         }
@@ -295,7 +299,8 @@ static bool discover(void)
                 s_status = 0;
                 rc = ble_gattc_read(s_conn, chr->handle2, read_cb,
                                     (void *)(uintptr_t)s_session);
-                if (rc != 0 || !procedure_wait(2500)) {
+                int wait_result = procedure_wait(2500);
+                if (rc != 0 || wait_result == 0) {
                     if (rc != 0) procedure_abort();
                     return false;
                 }
@@ -313,7 +318,7 @@ static bool discover(void)
                 s_status = 0;
                 rc = ble_gattc_disc_all_dscs(s_conn, desc_start, desc_end, dsc_cb,
                                              (void *)(uintptr_t)s_session);
-                if (rc != 0 || !procedure_wait(3000)) {
+                if (rc != 0 || procedure_wait(3000) != 1) {
                     if (rc != 0) procedure_abort();
                     return false;
                 }
@@ -418,7 +423,7 @@ esp_err_t ble_gatt_write(uint16_t handle, uint8_t flags,
     s_status = 0;
     int rc = ble_gattc_write_flat(s_conn, handle, value, value_len, write_cb,
                                   (void *)(uintptr_t)s_session);
-    if (rc != 0 || !procedure_wait(4000))
+    if (rc != 0 || procedure_wait(4000) != 1)
         return ESP_FAIL;
     return ESP_OK;
 }
@@ -442,7 +447,7 @@ esp_err_t ble_gatt_subscribe(uint16_t handle, bool enable, uint8_t mode)
     s_status = 0;
     int rc = ble_gattc_write_flat(s_conn, cccd, value, sizeof(value), write_cb,
                                   (void *)(uintptr_t)s_session);
-    if (rc != 0 || !procedure_wait(4000))
+    if (rc != 0 || procedure_wait(4000) != 1)
         return ESP_FAIL;
     if (enable) notify_reset();
     return ESP_OK;

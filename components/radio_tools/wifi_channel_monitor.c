@@ -35,7 +35,7 @@ static void rx_cb(void *buf, wifi_promiscuous_pkt_type_t type)
     s_packets++;
     s_bytes += pkt->rx_ctrl.sig_len;
     if (pkt->rx_ctrl.rssi > s_peak) s_peak = pkt->rx_ctrl.rssi;
-    if (s_mode == 1 && pkt->rx_ctrl.sig_len >= 2) {
+    if (s_mode == 1 && type == WIFI_PKT_MGMT && pkt->rx_ctrl.sig_len >= 2) {
         uint8_t ftype = (pkt->payload[0] & 0x0C) >> 2;
         uint8_t subtype = (pkt->payload[0] & 0xF0) >> 4;
         if (ftype == 0 && (subtype == 12 || subtype == 10)) s_deauth++;

