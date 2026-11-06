@@ -80,6 +80,9 @@ static uint8_t           s_buf[HS_BUF_SIZE];
 static uint32_t          s_len;          /* bytes used in s_buf */
 static bool              s_beacon_saved;
 static uint8_t           s_msg_mask;     /* bit0=M1 bit1=M2 bit2=M3 bit3=M4 */
+static uint8_t           s_pair_sta[6];
+static uint64_t          s_pair_replay;
+static bool              s_pair_have_m1;
 
 static inline bool mac_eq(const uint8_t *a, const uint8_t *b)
 {
@@ -151,7 +154,6 @@ static void promisc_rx(void *buf, wifi_promiscuous_pkt_type_t type)
 
     const ieee80211_hdr_t *hdr = (const ieee80211_hdr_t *)pkt->payload;
     const uint8_t fc0   = hdr->frame_ctrl[0];
-    const uint8_t flags = hdr->frame_ctrl[1];
 
     /* Frame must involve the target BSSID (any of the 3 addresses). */
     const bool bssid_match = mac_eq(hdr->addr1, s_target_bssid) ||
@@ -207,19 +209,36 @@ static void promisc_rx(void *buf, wifi_promiscuous_pkt_type_t type)
     }
 
     const int msg = eapol_classify(key_info, key_data_len);
+    uint64_t replay = 0;
+    if (eapol_avail >= 17) {
+        for (int i = 0; i < 8; i++) replay = (replay << 8) | eapol[9 + i];
+    }
+    if (msg == 1 && eapol_avail >= 17) {
+        memcpy(s_pair_sta, hdr->addr1, 6);
+        s_pair_replay = replay;
+        s_pair_have_m1 = true;
+        s_msg_mask = 0x01;   /* a newer M1 starts a new candidate exchange */
+    } else if (msg == 2 && s_pair_have_m1 && eapol_avail >= 17 &&
+               replay == s_pair_replay &&
+               mac_eq(hdr->addr2, s_pair_sta) &&
+               mac_eq(hdr->addr1, s_target_bssid)) {
+        s_msg_mask |= 0x02;
+    } else if (msg == 3 && (s_msg_mask & 0x03) == 0x03) {
+        s_msg_mask |= 0x04;
+    } else if (msg == 4 && (s_msg_mask & 0x07) == 0x07) {
+        s_msg_mask |= 0x08;
+    } else if (msg == 2) {
+        ESP_LOGW(TAG, "Ignoring unpaired EAPOL M2 (replay/station mismatch)");
+    }
     if (msg >= 1 && msg <= 4) {
-        s_msg_mask |= (uint8_t)(1u << (msg - 1));
-        ESP_LOGI(TAG, "EAPOL M%d captured (mask=0x%X, len=%u)",
+        ESP_LOGI(TAG, "EAPOL M%d seen (mask=0x%X, len=%u)",
                  msg, s_msg_mask, (unsigned)s_len);
     }
 
-    /* Complete when the full handshake (M1..M4) is seen, or at minimum the
-     * PTK-deriving pair M1+M2 has been captured. */
-    if ((s_msg_mask & 0x0F) == 0x0F) {
+    /* M1+M2 is sufficient for a crack attempt only when both frames belong to
+     * the same station and replay-counter exchange. M3/M4 extend that pair. */
+    if ((s_msg_mask & 0x03) == 0x03 && s_state == HS_CAPTURING)
         s_state = HS_COMPLETE;
-    } else if ((s_msg_mask & 0x03) == 0x03 && s_state == HS_CAPTURING) {
-        s_state = HS_COMPLETE;   /* M1+M2 sufficient for a crack attempt */
-    }
 }
 
 esp_err_t wifi_handshake_start(const uint8_t bssid[6], uint8_t channel)
@@ -237,6 +256,9 @@ esp_err_t wifi_handshake_start(const uint8_t bssid[6], uint8_t channel)
     memcpy(s_target_bssid, bssid, 6);
     s_beacon_saved = false;
     s_msg_mask     = 0;
+    s_pair_have_m1 = false;
+    s_pair_replay  = 0;
+    memset(s_pair_sta, 0, sizeof(s_pair_sta));
     s_len          = 0;
 
     pcap_hdr_t gh = {

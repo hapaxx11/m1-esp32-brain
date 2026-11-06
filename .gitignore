@@ -19,6 +19,7 @@ make_factory.ps1
 # Logs / temporary
 *.log
 *.tmp
+.audit/
 
 # OS files
 .DS_Store

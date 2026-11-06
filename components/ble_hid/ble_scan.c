@@ -36,7 +36,7 @@ static SemaphoreHandle_t s_mutex;          /* guards s_devs / s_dev_count */
 
 /* ---- Deferred-scan state (start requested before host sync) ------------ */
 
-static bool     s_scan_requested;          /* a scan is desired/active */
+static volatile bool s_scan_requested;     /* a scan is desired/active */
 static uint16_t s_scan_duration_sec;
 
 static void
@@ -92,6 +92,12 @@ scan_store_report(const struct ble_gap_disc_desc *disc)
 
     if (idx >= 0) {
         s_devs[idx].rssi = disc->rssi;          /* refresh RSSI each sighting */
+        if (disc->data != NULL && disc->length_data > 0 &&
+            (s_devs[idx].adv_len == 0 || disc->event_type != BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP)) {
+            s_devs[idx].adv_len = disc->length_data > BLE_SCAN_ADV_MAX
+                                ? BLE_SCAN_ADV_MAX : disc->length_data;
+            memcpy(s_devs[idx].adv, disc->data, s_devs[idx].adv_len);
+        }
         /* Fill the name once we have seen it (scan response may arrive late). */
         if (name_len > 0 && s_devs[idx].name[0] == '\0')
             memcpy(s_devs[idx].name, name, name_len + 1);
@@ -173,8 +179,12 @@ ble_scan_start(uint16_t duration_sec)
     /* If the host has already synced, start immediately; otherwise the sync
      * callback will call ble_scan_on_host_sync() to begin the scan. */
     int at = ble_host_own_addr_type();
-    if (at >= 0)
-        return scan_begin((uint8_t)at, duration_sec);
+    if (at >= 0) {
+        esp_err_t rc = scan_begin((uint8_t)at, duration_sec);
+        if (rc != ESP_OK)
+            s_scan_requested = false;
+        return rc;
+    }
 
     ESP_LOGI(TAG, "scan queued; will start after host sync");
     return ESP_OK;
@@ -187,6 +197,12 @@ ble_scan_stop(void)
     int rc = ble_gap_disc_cancel();
     if (rc != 0 && rc != BLE_HS_EALREADY)
         ESP_LOGW(TAG, "ble_gap_disc_cancel; rc=%d", rc);
+}
+
+bool
+ble_scan_is_active(void)
+{
+    return s_scan_requested || ble_gap_disc_active();
 }
 
 int
@@ -206,6 +222,21 @@ ble_scan_get_results(ble_scan_dev_t *out, int max)
     return n;
 }
 
+bool
+ble_scan_get_result(int index, ble_scan_dev_t *out)
+{
+    if (out == NULL || index < 0 || s_mutex == NULL)
+        return false;
+    bool found = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (index < s_dev_count) {
+        *out = s_devs[index];
+        found = true;
+    }
+    xSemaphoreGive(s_mutex);
+    return found;
+}
+
 void
 ble_scan_on_host_sync(void)
 {
@@ -215,6 +246,6 @@ ble_scan_on_host_sync(void)
         return;
 
     int at = ble_host_own_addr_type();
-    if (at >= 0)
-        scan_begin((uint8_t)at, s_scan_duration_sec);
+    if (at >= 0 && scan_begin((uint8_t)at, s_scan_duration_sec) != ESP_OK)
+        s_scan_requested = false;
 }

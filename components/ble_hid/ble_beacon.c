@@ -52,6 +52,29 @@ static esp_err_t beacon_start_raw(const uint8_t *adv, uint8_t len)
     return ESP_OK;
 }
 
+esp_err_t ble_beacon_start_raw_custom(const uint8_t *adv, uint8_t len,
+                                      const uint8_t addr[6], uint16_t interval_ms)
+{
+    if (adv == NULL || len == 0 || len > 31) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ble_host_ensure_started();
+    if (err != ESP_OK) return err;
+
+    uint8_t local_addr[6];
+    if (addr == NULL) ble_static_rnd_addr(local_addr, 0x03);
+    else memcpy(local_addr, addr, 6);
+
+    if (interval_ms < 20) interval_ms = 20;
+    if (interval_ms > 10000) interval_ms = 10000;
+    ble_extadv_stop(BLE_ADV_INST_BEACON);
+    int rc = ble_extadv_start_interval(BLE_ADV_INST_BEACON, false, true,
+                                       local_addr, adv, len,
+                                       interval_ms, interval_ms,
+                                       beacon_gap_event, NULL);
+    if (rc != 0) { ESP_LOGE(TAG, "raw adv start rc=%d", rc); return ESP_FAIL; }
+    s_running = true;
+    return ESP_OK;
+}
+
 esp_err_t ble_beacon_start_ibeacon(const uint8_t uuid[16], uint16_t major,
                                    uint16_t minor, int8_t tx_power)
 {

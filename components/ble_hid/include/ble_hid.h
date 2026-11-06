@@ -55,6 +55,13 @@ int  ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
                       const uint8_t *adv, uint8_t adv_len,
                       ble_gap_event_fn *cb, void *cb_arg);
 
+/* Variant with explicit advertising intervals in milliseconds. */
+int  ble_extadv_start_interval(uint8_t instance, bool connectable, bool use_legacy,
+                               const uint8_t rnd_addr[6],
+                               const uint8_t *adv, uint8_t adv_len,
+                               uint16_t interval_min_ms, uint16_t interval_max_ms,
+                               ble_gap_event_fn *cb, void *cb_arg);
+
 /* Stop the extended advertisement on `instance` (harmless if not advertising). */
 void ble_extadv_stop(uint8_t instance);
 
