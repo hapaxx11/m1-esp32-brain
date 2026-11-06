@@ -21,5 +21,11 @@ esp_err_t ble_beacon_start_ibeacon(const uint8_t uuid[16], uint16_t major,
  * standard suffix codes; truncated to the ~17 bytes that fit one adv). */
 esp_err_t ble_beacon_start_eddystone_url(const char *url);
 
+/* Raw non-connectable legacy advertisement. When addr is NULL a stable local
+ * random-static address is generated; otherwise addr supplies the identity
+ * (for protocols such as Find My that derive it from the payload key). */
+esp_err_t ble_beacon_start_raw_custom(const uint8_t *adv, uint8_t len,
+                                      const uint8_t addr[6], uint16_t interval_ms);
+
 void ble_beacon_stop(void);
 bool ble_beacon_is_running(void);

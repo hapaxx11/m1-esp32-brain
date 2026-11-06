@@ -15,11 +15,14 @@
 #define BLE_SCAN_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define BLE_SCAN_ADV_MAX 31
 
 /** A single discovered advertiser. */
 typedef struct {
@@ -27,6 +30,8 @@ typedef struct {
     uint8_t addr_type;    /**< BLE_ADDR_* address type. */
     int8_t  rssi;         /**< Last-seen RSSI in dBm (127 = unavailable). */
     char    name[32];     /**< NUL-terminated local name ("" if none seen). */
+    uint8_t adv_len;      /**< Bytes retained in adv (legacy AD structures). */
+    uint8_t adv[BLE_SCAN_ADV_MAX];
 } ble_scan_dev_t;
 
 /**
@@ -43,11 +48,17 @@ esp_err_t ble_scan_start(uint16_t duration_sec);
 /** Cancel an in-progress scan (ble_gap_disc_cancel). Safe if not scanning. */
 void ble_scan_stop(void);
 
+/** Return true while a requested or active scan has not completed. */
+bool ble_scan_is_active(void);
+
 /**
  * Copy up to `max` discovered devices into out[].
  * @return the number of entries written.
  */
 int ble_scan_get_results(ble_scan_dev_t *out, int max);
+
+/** Copy one result by zero-based index; returns false when index is out of range. */
+bool ble_scan_get_result(int index, ble_scan_dev_t *out);
 
 /**
  * Internal: invoked by the shared host sync callback (ble_hid.c) so a scan

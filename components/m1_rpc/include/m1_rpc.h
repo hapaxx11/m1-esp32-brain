@@ -124,6 +124,7 @@ typedef enum {
     M1_RPC_SYS_OTA_DATA        = 0x0007, /* REQ  u8[] data    -> RESP u8 status */
     M1_RPC_SYS_OTA_END         = 0x0008, /* REQ  u8 reboot    -> RESP u8 status */
     M1_RPC_SYS_SNTP_SYNC       = 0x0009, /* REQ  (none, WiFi up) -> RESP m1_rpc_time_t (or NAK) */
+    M1_RPC_SYS_OTA_ABORT       = 0x000A, /* REQ  (none) -> RESP u8 status; discard partial image */
 
     /* ---- WiFi station 0x0100-0x01FF ---- */
     M1_RPC_WIFI_GET_MODE       = 0x0100,
@@ -166,6 +167,18 @@ typedef enum {
     M1_RPC_OFF_CAPTIVE_STOP    = 0x0317,
     M1_RPC_OFF_CAPTIVE_CREDS   = 0x0318, /* RESP [count:1] then per cred [ts:4][ulen:1][u][plen:1][p] */
     M1_RPC_OFF_CAPTIVE_DIAG    = 0x0319, /* RESP [dns_q:4][http_hits:4][clients:1] */
+    M1_RPC_OFF_PMKID_STATUS    = 0x031A, /* RESP [state:1][total_len:4] */
+    M1_RPC_OFF_PMKID_GET       = 0x031B, /* REQ [offset:4][len:2] -> RESP PCAP bytes */
+    M1_RPC_OFF_PMKID_STOP      = 0x031C,
+    M1_RPC_WPS_START           = 0x0320, /* REQ [hop_dwell_ms:2 LE] */
+    M1_RPC_WPS_NEXT            = 0x0321, /* RESP [done:1][progress:1][entry...] */
+    M1_RPC_WPS_STOP            = 0x0322,
+    M1_RPC_CHANNEL_MON_START   = 0x0323, /* REQ [mode:1][dwell_ms:2 LE]; 0=airtime,1=deauth */
+    M1_RPC_CHANNEL_MON_STATS   = 0x0324, /* RESP 13 x [packets:4][bytes/deauth:4][rssi:i8][load:1] */
+    M1_RPC_CHANNEL_MON_STOP    = 0x0325,
+    M1_RPC_CSI_START           = 0x0326, /* REQ [mode:1][channel:1][mac:6 optional] */
+    M1_RPC_CSI_STATUS          = 0x0327, /* RESP latest calibrated motion/presence sample */
+    M1_RPC_CSI_STOP            = 0x0328,
 
     /* ---- BLE 0x0400-0x04FF ---- */
     M1_RPC_BLE_INIT            = 0x0400,
@@ -187,6 +200,15 @@ typedef enum {
     M1_RPC_BLE_STATE           = 0x0410, /* REQ (none) -> RESP u8 flags: bit0 direct_adv, bit1 direct_conn, bit2 hid_adv, bit3 hid_conn */
     M1_RPC_BLE_BEACON_START    = 0x0411, /* REQ [type:1] then iBeacon [uuid:16][major:2 LE][minor:2 LE][tx:i8] OR Eddystone-URL [url bytes] -> RESP u8 status */
     M1_RPC_BLE_BEACON_STOP     = 0x0412, /* REQ (none) -> RESP u8 status */
+    M1_RPC_BLE_RAW_SCAN_START  = 0x0413, /* REQ [duration_s:2 LE] */
+    M1_RPC_BLE_RAW_SCAN_NEXT   = 0x0414, /* RESP [done:1=complete, 0xFE=pending][rssi:i8][addr_type:1][addr:6][adv_len:1][adv] */
+    M1_RPC_BLE_ADV_RAW         = 0x0415, /* REQ [flags:1][interval_ms:2 LE][addr:6 optional][adv] */
+    M1_RPC_BLE_GATT_START      = 0x0416, /* REQ [addr:6][addr_type:1] */
+    M1_RPC_BLE_GATT_NEXT       = 0x0417, /* RESP next service/characteristic record */
+    M1_RPC_BLE_GATT_STOP       = 0x0418,
+    M1_RPC_BLE_GATT_WRITE      = 0x0419, /* REQ [handle:2 LE][flags:1][len:1][data] */
+    M1_RPC_BLE_GATT_SUB        = 0x041A, /* REQ [handle:2 LE][mode:1] */
+    M1_RPC_BLE_GATT_NOTIF      = 0x041B, /* RESP queued notification or empty */
 
     /* ---- Zigbee / 802.15.4 0x0500-0x05FF ---- */
     M1_RPC_ZB_INIT             = 0x0500,
@@ -217,6 +239,11 @@ typedef enum {
     M1_RPC_NET_HTTP_OPEN       = 0x0800, /* REQ [accept:1][timeout_ms:4 LE][url_len:2 LE][url] */
     M1_RPC_NET_HTTP_READ       = 0x0801, /* REQ [max_len:2 LE] -> RESP body bytes; empty = EOF */
     M1_RPC_NET_HTTP_CLOSE      = 0x0802, /* REQ (none) -> RESP (none) */
+
+    /* ---- Network scanners 0x0900-0x09FF ---- */
+    M1_RPC_NETSCAN_START       = 0x0900, /* REQ [mode:1][timeout_ms:1] */
+    M1_RPC_NETSCAN_NEXT        = 0x0901, /* RESP binary-SPI-compatible result/progress */
+    M1_RPC_NETSCAN_STOP        = 0x0902,
 } m1_rpc_id_t;
 
 /* ---------- Event IDs 0xE000-0xEFFF (ESP32 -> STM32, msg_type = EVENT) ---------- */
@@ -297,6 +324,11 @@ typedef enum {
 #define M1_CAP_SOFTAP        (UINT64_C(1) << 23)
 #define M1_CAP_ESPNOW        (UINT64_C(1) << 24)
 #define M1_CAP_HTTP          (UINT64_C(1) << 28)
+#define M1_CAP_BLE_RAW       (UINT64_C(1) << 29)
+#define M1_CAP_WPS           (UINT64_C(1) << 30)
+#define M1_CAP_CHANNEL_MON   (UINT64_C(1) << 31)
+#define M1_CAP_DEAUTH_MON    (UINT64_C(1) << 32)
+#define M1_CAP_CSI           (UINT64_C(1) << 33)
 
 #define M1_RPC_FW_NAME_LEN   32
 

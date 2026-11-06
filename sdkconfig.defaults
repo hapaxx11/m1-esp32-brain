@@ -25,6 +25,7 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 # WiFi
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 CONFIG_ESP_WIFI_ENABLE_SAE=y
+CONFIG_ESP_WIFI_CSI_ENABLED=y
 
 # Trust public HTTPS servers used for OTA release listings and downloads
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
@@ -48,9 +49,10 @@ CONFIG_FREERTOS_HZ=1000
 # Log level
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Partition table
+# Partition table and rollback-safe application OTA
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # Captive portal: browsers send >512B of request headers; raise the limit
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048

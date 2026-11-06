@@ -21,6 +21,7 @@
 #include "wifi_attack.h"
 #include "wifi_sta_scan.h"
 #include "wifi_handshake.h"
+#include "wifi_pmkid.h"
 #include "rpc_server.h"
 #include "ble_hid.h"
 #include "ble_scan.h"
@@ -28,9 +29,15 @@
 #include "ble_spam.h"
 #include "ble_nus.h"
 #include "ble_beacon.h"
+#include "ble_gatt.h"
 #include "ieee802154_sniff.h"
 #include "esp_now_link.h"
 #include "http_stream.h"
+#include "net_scan.h"
+#include "wifi_wps.h"
+#include "wifi_channel_monitor.h"
+#include "wifi_csi.h"
+#include "ota_update.h"
 #include "m1_rpc.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -38,6 +45,7 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"
 #include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -46,16 +54,22 @@
 static const char *TAG = "main";
 
 /* This firmware's identity + honest capability set (only features actually wired).
- * Every bit below has a working handler in dispatch_request(); do not advertise a
- * capability whose handler still returns NAK (PMKID/OTA/SET_MAC/SET_CHAN/NETSCAN
- * /BLE_GATT are intentionally omitted until implemented). */
+ * OTA is added at runtime only when an inactive OTA slot is available. */
 #define M1_FW_NAME  "m1-native"
-#define M1_FW_CAPS  (M1_CAP_WIFI_SCAN | M1_CAP_WIFI_JOIN | M1_CAP_DEAUTH   | \
+#define M1_FW_CAPS_BASE (M1_CAP_WIFI_SCAN | M1_CAP_WIFI_JOIN | M1_CAP_DEAUTH   | \
                      M1_CAP_PKTMON    | M1_CAP_STA_SCAN  | M1_CAP_BEACON   | \
                      M1_CAP_PORTAL    | M1_CAP_HANDSHAKE | M1_CAP_802154   | \
                      M1_CAP_BLE_SCAN  | M1_CAP_BLE_ADV   | M1_CAP_BLE_HID  | \
                      M1_CAP_BLE_SPAM  | M1_CAP_802154_TX | M1_CAP_PROBE_FLOOD | \
-                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_ESPNOW | M1_CAP_HTTP)
+                     M1_CAP_KARMA     | M1_CAP_SOFTAP    | M1_CAP_ESPNOW | M1_CAP_HTTP | \
+                     M1_CAP_BLE_RAW   | M1_CAP_PMKID    | M1_CAP_NETSCAN | M1_CAP_BLE_GATT | \
+                     M1_CAP_WPS       | M1_CAP_CHANNEL_MON | M1_CAP_DEAUTH_MON)
+#if CONFIG_ESP_WIFI_CSI_ENABLED
+#define M1_FW_CSI_CAP M1_CAP_CSI
+#else
+#define M1_FW_CSI_CAP 0
+#endif
+#define M1_FW_CAPS (M1_FW_CAPS_BASE | M1_FW_CSI_CAP)
 
 /* Max scan-response payload; fragmented across frames, fits the M1's 2KB
  * reassembly buffer. (Handshake uses chunked reads, not this.) */
@@ -90,6 +104,7 @@ static uint8_t s_rx_buf[M1_RPC_DMA_MAX_LEN];
  * seconds in GAP ADV_COMPLETE callbacks. */
 static bool s_ble_direct_enabled = false;
 static bool s_ble_direct_restore_after_hid = false;
+static int s_ble_raw_scan_cursor = 0;
 
 /* ---------- Frame send helpers (ESP32 -> M1) ---------- */
 
@@ -149,7 +164,9 @@ static void handle_get_status(const m1_rpc_header_t *hdr)
 {
     m1_rpc_devstatus_t st = {0};
     st.proto_ver = M1_RPC_VERSION;
-    m1_rpc_caps_set(st.cap_bitmap, M1_FW_CAPS);
+    uint64_t caps = M1_FW_CAPS;
+    if (ota_update_available()) caps |= M1_CAP_OTA;
+    m1_rpc_caps_set(st.cap_bitmap, caps);
     strncpy(st.fw_name, M1_FW_NAME, sizeof(st.fw_name) - 1);
     send_resp(hdr->msg_id, (const uint8_t *)&st, sizeof(st));
 }
@@ -208,6 +225,41 @@ static void handle_sntp_sync(const m1_rpc_header_t *hdr)
         .weekday = (uint8_t)tmv.tm_wday,
     };
     send_resp(hdr->msg_id, (const uint8_t *)&t, sizeof(t));
+}
+
+static void handle_ota_begin(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (len != 4) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint32_t size = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) |
+                    ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 24);
+    esp_err_t err = ota_update_begin(size);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+}
+
+static void handle_ota_data(const m1_rpc_header_t *hdr,
+                            const uint8_t *payload, uint16_t len)
+{
+    esp_err_t err = ota_update_write(payload, len);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_ota_end(const m1_rpc_header_t *hdr,
+                           const uint8_t *payload, uint16_t len)
+{
+    if (len < 1) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    esp_err_t err = ota_update_end();
+    if (err != ESP_OK) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+        return;
+    }
+    send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    if (payload[0]) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_restart();
+    }
 }
 
 /* ---------- WiFi handlers ---------- */
@@ -499,6 +551,43 @@ static void handle_hs_get(const m1_rpc_header_t *hdr,
     send_resp(hdr->msg_id, chunk, n > 0 ? (uint16_t)n : 0);
 }
 
+static void handle_pmkid_start(const m1_rpc_header_t *hdr,
+                               const uint8_t *payload, uint16_t len)
+{
+    if (len < 8) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint8_t ssid_len = payload[7];
+    if (ssid_len == 0 || ssid_len > 32 || (uint16_t)(8 + ssid_len) > len) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+    char ssid[33] = {0};
+    memcpy(ssid, &payload[8], ssid_len);
+    esp_err_t err = wifi_pmkid_start(payload, payload[6], ssid);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_pmkid_status(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[5];
+    resp[0] = (uint8_t)wifi_pmkid_state();
+    uint32_t total = wifi_pmkid_len();
+    memcpy(&resp[1], &total, 4);
+    send_resp(hdr->msg_id, resp, sizeof(resp));
+}
+
+static void handle_pmkid_get(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (len < 6) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint32_t offset = payload[0] | (payload[1] << 8) | (payload[2] << 16) | (payload[3] << 24);
+    uint16_t want = payload[4] | (payload[5] << 8);
+    if (want > M1L_PAYLOAD_MAX) want = M1L_PAYLOAD_MAX;
+    static uint8_t chunk[M1L_PAYLOAD_MAX];
+    int n = wifi_pmkid_read(offset, chunk, want);
+    send_resp(hdr->msg_id, chunk, n > 0 ? (uint16_t)n : 0);
+}
+
 static void handle_sta_scan_results(const m1_rpc_header_t *hdr)
 {
     static wifi_sta_dev_t stas[32];
@@ -784,6 +873,113 @@ static void handle_ble_beacon_start(const m1_rpc_header_t *hdr,
     else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
 }
 
+static void handle_ble_raw_scan_start(const m1_rpc_header_t *hdr,
+                                      const uint8_t *payload, uint16_t len)
+{
+    uint16_t dur = len >= 2 ? (uint16_t)(payload[0] | (payload[1] << 8)) : 5;
+    esp_err_t err = ble_scan_start(dur);
+    if (err == ESP_OK) {
+        s_ble_raw_scan_cursor = 0;
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    } else {
+        send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+    }
+}
+
+static void handle_ble_raw_scan_next(const m1_rpc_header_t *hdr)
+{
+    ble_scan_dev_t dev;
+    if (!ble_scan_get_result(s_ble_raw_scan_cursor, &dev)) {
+        if (ble_scan_is_active())
+            send_resp(hdr->msg_id, (const uint8_t[]){ 0xFE }, 1);
+        else
+            send_resp(hdr->msg_id, (const uint8_t[]){ 1 }, 1);
+        return;
+    }
+    s_ble_raw_scan_cursor++;
+    uint8_t resp[10 + BLE_SCAN_ADV_MAX];
+    resp[0] = 0;
+    resp[1] = (uint8_t)dev.rssi;
+    resp[2] = dev.addr_type;
+    memcpy(&resp[3], dev.addr, 6);
+    resp[9] = dev.adv_len;
+    memcpy(&resp[10], dev.adv, dev.adv_len);
+    send_resp(hdr->msg_id, resp, (uint16_t)(10 + dev.adv_len));
+}
+
+static void handle_ble_adv_raw(const m1_rpc_header_t *hdr,
+                               const uint8_t *payload, uint16_t len)
+{
+    if (len < 4) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint8_t flags = payload[0];
+    uint16_t interval = (uint16_t)(payload[1] | (payload[2] << 8));
+    uint16_t off = 3;
+    const uint8_t *addr = NULL;
+    if (flags & 0x01) {
+        if (len < 9) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+        addr = &payload[3];
+        off += 6;
+    }
+    uint16_t adv_len = (uint16_t)(len - off);
+    if (adv_len == 0 || adv_len > 31) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+    esp_err_t err = ble_beacon_start_raw_custom(&payload[off], (uint8_t)adv_len,
+                                                addr, interval ? interval : 200);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_ble_gatt_start(const m1_rpc_header_t *hdr,
+                                  const uint8_t *payload, uint16_t len)
+{
+    if (len < 7) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    esp_err_t err = ble_gatt_start(payload, payload[6]);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_ble_gatt_next(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[7 + 16 + 1 + 16];
+    int n = ble_gatt_next(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
+static void handle_ble_gatt_write(const m1_rpc_header_t *hdr,
+                                  const uint8_t *payload, uint16_t len)
+{
+    if (len < 5) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint16_t handle = (uint16_t)(payload[0] | (payload[1] << 8));
+    uint8_t value_len = payload[3];
+    if ((uint16_t)(4 + value_len) > len) {
+        send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+    esp_err_t err = ble_gatt_write(handle, payload[2], &payload[4], value_len);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_ble_gatt_sub(const m1_rpc_header_t *hdr,
+                                const uint8_t *payload, uint16_t len)
+{
+    if (len != 3 || payload[2] > 2) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint16_t handle = (uint16_t)(payload[0] | (payload[1] << 8));
+    uint8_t mode = payload[2];
+    esp_err_t err = ble_gatt_subscribe(handle, mode != 0, mode);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_ble_gatt_notif(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[5 + 48];
+    int n = ble_gatt_notify_next(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
 /* Bluetooth Direct: start/stop advertising the NUS RPC service (M1 toggle). */
 static void handle_ble_rpc_adv(const m1_rpc_header_t *hdr,
                                const uint8_t *payload, uint16_t len)
@@ -917,6 +1113,82 @@ static void handle_http_close(const m1_rpc_header_t *hdr)
     send_resp(hdr->msg_id, NULL, 0);
 }
 
+static void handle_netscan_start(const m1_rpc_header_t *hdr,
+                                 const uint8_t *payload, uint16_t len)
+{
+    if (len < 2) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint8_t base[4];
+    esp_err_t err = net_scan_start(payload[0], payload[1], base);
+    if (err != ESP_OK) {
+        send_nak(hdr->msg_id, err == ESP_ERR_INVALID_STATE
+               ? M1_RPC_ERR_NOT_RUNNING : M1_RPC_ERR_INVALID_ARGS);
+        return;
+    }
+    send_resp(hdr->msg_id, base, sizeof(base));
+}
+
+static void handle_netscan_next(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[16];
+    int n = net_scan_next(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
+static void handle_wps_start(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    uint16_t dwell = len >= 2 ? (uint16_t)(payload[0] | (payload[1] << 8)) : 320;
+    esp_err_t err = wifi_wps_start(dwell);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_wps_next(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[2 + 6 + 1 + 32 + 3];
+    int n = wifi_wps_next(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
+static void handle_channel_mon_start(const m1_rpc_header_t *hdr,
+                                     const uint8_t *payload, uint16_t len)
+{
+    if (len < 3) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    uint16_t dwell = (uint16_t)(payload[1] | (payload[2] << 8));
+    esp_err_t err = wifi_channel_monitor_start(payload[0], dwell);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_channel_mon_stats(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[1 + 13 * 10];
+    int n = wifi_channel_monitor_stats(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
+static void handle_csi_start(const m1_rpc_header_t *hdr,
+                             const uint8_t *payload, uint16_t len)
+{
+    if (len < 2) { send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS); return; }
+    const uint8_t *mac = len >= 8 ? &payload[2] : NULL;
+    esp_err_t err = wifi_csi_start(payload[0], payload[1], mac);
+    if (err == ESP_OK) send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+    else if (err == ESP_ERR_INVALID_STATE) send_nak(hdr->msg_id, M1_RPC_ERR_NOT_RUNNING);
+    else if (err == ESP_ERR_INVALID_ARG) send_nak(hdr->msg_id, M1_RPC_ERR_INVALID_ARGS);
+    else if (err == ESP_ERR_NO_MEM) send_nak(hdr->msg_id, M1_RPC_ERR_NO_MEM);
+    else if (err == ESP_ERR_WIFI_NOT_INIT || err == ESP_ERR_WIFI_NOT_STARTED)
+        send_nak(hdr->msg_id, M1_RPC_ERR_NOT_INIT);
+    else               send_nak(hdr->msg_id, M1_RPC_ERR_HARDWARE);
+}
+
+static void handle_csi_status(const m1_rpc_header_t *hdr)
+{
+    uint8_t resp[24];
+    int n = wifi_csi_status(resp, sizeof(resp));
+    send_resp(hdr->msg_id, resp, (uint16_t)n);
+}
+
 /* ---------- Screen push (M1 -> ESP -> qMonstatek) ---------- */
 
 static void handle_screen_push(const m1_rpc_header_t *hdr,
@@ -960,6 +1232,19 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_SYS_SNTP_SYNC:
         handle_sntp_sync(hdr);
+        break;
+    case M1_RPC_SYS_OTA_BEGIN:
+        handle_ota_begin(hdr, payload, payload_len);
+        break;
+    case M1_RPC_SYS_OTA_DATA:
+        handle_ota_data(hdr, payload, payload_len);
+        break;
+    case M1_RPC_SYS_OTA_END:
+        handle_ota_end(hdr, payload, payload_len);
+        break;
+    case M1_RPC_SYS_OTA_ABORT:
+        ota_update_abort();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
     case M1_RPC_SYS_RESET:
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
@@ -1018,6 +1303,19 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
     case M1_RPC_OFF_HS_STOP:
         wifi_handshake_stop();
         wifi_attack_deauth_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_OFF_PMKID_CAPTURE:
+        handle_pmkid_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_OFF_PMKID_STATUS:
+        handle_pmkid_status(hdr);
+        break;
+    case M1_RPC_OFF_PMKID_GET:
+        handle_pmkid_get(hdr, payload, payload_len);
+        break;
+    case M1_RPC_OFF_PMKID_STOP:
+        wifi_pmkid_stop();
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
     case M1_RPC_OFF_BEACON_START:
@@ -1134,6 +1432,34 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         ble_beacon_stop();
         send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
+    case M1_RPC_BLE_RAW_SCAN_START:
+        handle_ble_raw_scan_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_RAW_SCAN_NEXT:
+        handle_ble_raw_scan_next(hdr);
+        break;
+    case M1_RPC_BLE_ADV_RAW:
+        handle_ble_adv_raw(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_GATT_START:
+        handle_ble_gatt_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_GATT_NEXT:
+        handle_ble_gatt_next(hdr);
+        break;
+    case M1_RPC_BLE_GATT_STOP:
+        ble_gatt_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_BLE_GATT_WRITE:
+        handle_ble_gatt_write(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_GATT_SUB:
+        handle_ble_gatt_sub(hdr, payload, payload_len);
+        break;
+    case M1_RPC_BLE_GATT_NOTIF:
+        handle_ble_gatt_notif(hdr);
+        break;
 
     /* 802.15.4 (Zigbee/Thread) device discovery */
     case M1_RPC_ZB_SNIFF_START:
@@ -1189,6 +1515,47 @@ static void dispatch_request(const m1_rpc_header_t *hdr,
         break;
     case M1_RPC_NET_HTTP_CLOSE:
         handle_http_close(hdr);
+        break;
+
+    case M1_RPC_NETSCAN_START:
+        handle_netscan_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_NETSCAN_NEXT:
+        handle_netscan_next(hdr);
+        break;
+    case M1_RPC_NETSCAN_STOP:
+        net_scan_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_WPS_START:
+        handle_wps_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_WPS_NEXT:
+        handle_wps_next(hdr);
+        break;
+    case M1_RPC_WPS_STOP:
+        wifi_wps_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_CHANNEL_MON_START:
+        handle_channel_mon_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_CHANNEL_MON_STATS:
+        handle_channel_mon_stats(hdr);
+        break;
+    case M1_RPC_CHANNEL_MON_STOP:
+        wifi_channel_monitor_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
+        break;
+    case M1_RPC_CSI_START:
+        handle_csi_start(hdr, payload, payload_len);
+        break;
+    case M1_RPC_CSI_STATUS:
+        handle_csi_status(hdr);
+        break;
+    case M1_RPC_CSI_STOP:
+        wifi_csi_stop();
+        send_resp(hdr->msg_id, (const uint8_t[]){ M1_RPC_OK }, 1);
         break;
 
     /* Screen streaming */
@@ -1335,7 +1702,11 @@ void app_main(void)
     rpc_server_config_t rpc_cfg = RPC_SERVER_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(rpc_server_init(&rpc_cfg));
 
-    xTaskCreate(cmd_dispatch_task, "cmd_dispatch", 8192, NULL, 8, NULL);
+    if (xTaskCreate(cmd_dispatch_task, "cmd_dispatch", 8192, NULL, 8, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Command dispatcher creation failed; rebooting without validation");
+        esp_restart();
+    }
+    esp_ota_mark_app_valid_cancel_rollback();
 
     ESP_LOGI(TAG, "Ready. Waiting for m1_rpc requests from M1...");
 }

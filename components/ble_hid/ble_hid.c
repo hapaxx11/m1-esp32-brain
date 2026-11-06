@@ -467,10 +467,11 @@ ble_static_rnd_addr(uint8_t out[6], uint8_t salt)
 }
 
 int
-ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
-                 const uint8_t rnd_addr[6],
-                 const uint8_t *adv, uint8_t adv_len,
-                 ble_gap_event_fn *cb, void *cb_arg)
+ble_extadv_start_interval(uint8_t instance, bool connectable, bool use_legacy,
+                          const uint8_t rnd_addr[6],
+                          const uint8_t *adv, uint8_t adv_len,
+                          uint16_t interval_min_ms, uint16_t interval_max_ms,
+                          ble_gap_event_fn *cb, void *cb_arg)
 {
     struct ble_gap_ext_adv_params params;
     memset(&params, 0, sizeof params);
@@ -480,8 +481,8 @@ ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
     params.own_addr_type = BLE_OWN_ADDR_RANDOM;
     params.primary_phy   = BLE_HCI_LE_PHY_1M;
     params.secondary_phy = BLE_HCI_LE_PHY_1M;
-    params.itvl_min      = 0x30;                 /* 30 ms (0.625 ms units) */
-    params.itvl_max      = 0x60;                 /* 60 ms */
+    params.itvl_min      = (uint16_t)((interval_min_ms * 1000u + 312u) / 625u);
+    params.itvl_max      = (uint16_t)((interval_max_ms * 1000u + 312u) / 625u);
     params.sid           = instance;
     params.tx_power      = 127;
 
@@ -508,6 +509,16 @@ ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
     rc = ble_gap_ext_adv_start(instance, 0, 0);   /* forever, unlimited events */
     if (rc != 0) ESP_LOGE(TAG, "ext_adv_start inst%u rc=%d", instance, rc);
     return rc;
+}
+
+int
+ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
+                 const uint8_t rnd_addr[6],
+                 const uint8_t *adv, uint8_t adv_len,
+                 ble_gap_event_fn *cb, void *cb_arg)
+{
+    return ble_extadv_start_interval(instance, connectable, use_legacy, rnd_addr,
+                                     adv, adv_len, 30, 60, cb, cb_arg);
 }
 
 void
