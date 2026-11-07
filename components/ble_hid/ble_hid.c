@@ -524,6 +524,8 @@ ble_extadv_start(uint8_t instance, bool connectable, bool use_legacy,
 void
 ble_extadv_stop(uint8_t instance)
 {
+    if (!s_host_inited)
+        return;
     ble_gap_ext_adv_stop(instance);
 }
 
